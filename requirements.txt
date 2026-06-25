@@ -1,0 +1,4 @@
+# MCP SDK with Streamable HTTP transport support.
+# This also pulls in uvicorn + starlette (the ASGI runner used by the transport),
+# httpx, anyio, pydantic, etc. as transitive dependencies.
+mcp>=1.27.0
