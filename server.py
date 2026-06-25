@@ -17,7 +17,7 @@ READ_MAX_BYTES = int(os.environ.get("MCP_READ_MAX_BYTES", str(50 * 1024)))
 
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MCP_PORT", "8088"))
-TRUNC_LIMIT = int(os.environ.get("MCP_TRUNC_LIMIT", "4096"))
+TRUNC_LIMIT = int(os.environ.get("MCP_TRUNC_LIMIT", "8192"))
 MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "50"))
 
 # session_id -> {"stdout": bytes, "stderr": bytes}

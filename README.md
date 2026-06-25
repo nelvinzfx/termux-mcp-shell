@@ -34,7 +34,7 @@ Find the device IP with `ifconfig` or `ip addr`.
 |----------------------|-----------|-------------------------------------|
 | `MCP_HOST`           | `0.0.0.0` | bind address                        |
 | `MCP_PORT`           | `8088`    | port                                |
-| `MCP_TRUNC_LIMIT`    | `4096`    | max stdout/stderr bytes per reply   |
+| `MCP_TRUNC_LIMIT`    | `8192`    | max stdout/stderr bytes per reply   |
 | `MCP_MAX_SESSIONS`   | `50`      | output buffers kept in memory (FIFO)|
 | `MCP_READ_MAX_LINES` | `2000`    | max lines per `read_file`           |
 | `MCP_READ_MAX_BYTES` | `51200`   | max bytes per `read_file` (50KB)    |
