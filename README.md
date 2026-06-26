@@ -48,15 +48,23 @@ Find the device IP with `ifconfig` or `ip addr`.
   chunk from a command's output buffer (`stream`: `stdout`/`stderr`).
 - **`read_file(path, offset?, limit?)`**: read a text file with 1-indexed
   line numbers. `offset` = start line, `limit` = number of lines. Auto-truncates
-  at 2000 lines / 50KB and returns `next_offset` to continue.
+  at 2000 lines / 50KB, appends a clear `--- TRUNCATED ... ---` footer, and
+  returns `next_offset` to continue.
 - **`write_file(path, content)`**: create or overwrite a file; parent dirs are
   created automatically.
-- **`edit_file(path, edits)`**: exact-text replacement, modeled after pi.
-  `edits` is a list of `{old_text, new_text}`. Each `old_text` must match
-  exactly and be unique, is matched against the original content, must not
-  overlap, and all edits apply atomically (all-or-nothing). If an exact match
-  fails, a fuzzy match is tried (trailing whitespace, smart quotes, unicode
-  dashes/spaces). CRLF line endings and BOM are preserved. Returns a unified diff.
+- **`edit_file(path, edits, dry_run?, partial?)`**: text replacement, modeled
+  after pi. `edits` is a list of `{old_text, new_text}`. Matching is tried in
+  three tiers per edit: exact, then whitespace/smart-quote/unicode tolerant,
+  then indent-insensitive (leading whitespace ignored and `new_text` is
+  re-indented to fit, handy for indented Python/YAML blocks). Each `old_text`
+  must resolve to a unique location and edits must not overlap.
+  - `partial=false` (default): atomic, any failed edit aborts and writes nothing.
+  - `partial=true`: apply matching edits, skip the rest, report per-edit status
+    in `results`.
+  - `dry_run=true`: return the diff without writing.
+
+  CRLF line endings and BOM are preserved. Returns a unified diff plus a
+  per-edit `results` list.
 
 ## Security note
 

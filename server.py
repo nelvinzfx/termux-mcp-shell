@@ -175,35 +175,104 @@ def _find(content: str, old: str) -> tuple[bool, int, int, bool]:
     return True, fi, len(fo), True
 
 
-def _apply_edits(normalized: str, edits: list[dict], path: str) -> tuple[str, str]:
-    norm = [{"old": _normalize_lf(e["old_text"]), "new": _normalize_lf(e["new_text"])} for e in edits]
-    for i, e in enumerate(norm):
-        if not e["old"]:
-            raise ValueError(f"edits[{i}].old_text must not be empty in {path}.")
-    used_fuzzy = any(_find(normalized, e["old"])[3] for e in norm)
-    base = _fuzzy(normalized) if used_fuzzy else normalized
-    matched = []
-    for i, e in enumerate(norm):
-        found, idx, mlen, _ = _find(base, e["old"])
-        if not found:
-            raise ValueError(f"Could not find edits[{i}] in {path}. old_text must match exactly "
-                             f"(including whitespace/newlines).")
-        fo = _fuzzy(e["old"]) if used_fuzzy else e["old"]
+def _find_indent(content: str, old: str) -> tuple[bool, int, int, str]:
+    """Indent-insensitive line match. Returns (found, char_index, match_len, matched_text)."""
+    c_lines = content.split("\n")
+    o_stripped = [l.strip() for l in old.split("\n")]
+    n = len(o_stripped)
+    hits = [s for s in range(len(c_lines) - n + 1)
+            if all(c_lines[s + j].strip() == o_stripped[j] for j in range(n))]
+    if len(hits) != 1:
+        return False, -1, 0, ""
+    s = hits[0]
+    char_idx = sum(len(c_lines[k]) + 1 for k in range(s))
+    matched = "\n".join(c_lines[s:s + n])
+    return True, char_idx, len(matched), matched
+
+
+def _reindent(new: str, matched: str, old: str) -> str:
+    """Re-indent new_text by the indent delta between the matched block and what the model sent."""
+    def indent_of(line: str) -> str:
+        return line[: len(line) - len(line.lstrip())]
+    actual = indent_of(matched.split("\n")[0])
+    intended = indent_of(old.split("\n")[0])
+    if actual == intended:
+        return new
+    out = []
+    for line in new.split("\n"):
+        if line.startswith(intended):
+            out.append(actual + line[len(intended):])
+        elif not line.strip():
+            out.append(line)
+        else:
+            out.append(actual + line.lstrip())
+    return "\n".join(out)
+
+
+def _match_one(base: str, used_fuzzy: bool, old: str, new: str, path: str, label: str):
+    """Resolve one edit: exact/trailing-fuzzy, then indent-insensitive with re-indent."""
+    found, idx, mlen, _ = _find(base, old)
+    if found:
+        fo = _fuzzy(old) if used_fuzzy else old
         occ = base.count(fo)
         if occ > 1:
-            raise ValueError(f"Found {occ} occurrences of edits[{i}] in {path}. Each old_text must "
+            raise ValueError(f"Found {occ} occurrences of {label} in {path}. Each old_text must "
                              f"be unique. Provide more context.")
-        matched.append({"i": i, "idx": idx, "len": mlen, "new": e["new"]})
+        return idx, mlen, new
+    fi, fidx, flen, matched = _find_indent(base, old)
+    if fi:
+        return fidx, flen, _reindent(new, matched, old)
+    o_stripped = [l.strip() for l in old.split("\n")]
+    c_lines = base.split("\n")
+    nl = len(o_stripped)
+    occ = sum(1 for s in range(len(c_lines) - nl + 1)
+              if all(c_lines[s + j].strip() == o_stripped[j] for j in range(nl)))
+    if occ > 1:
+        raise ValueError(f"Found {occ} indent-insensitive matches of {label} in {path}. "
+                         f"Provide more surrounding context to make it unique.")
+    raise ValueError(f"Could not find {label} in {path}. The line content must match "
+                     f"(leading/trailing whitespace differences are tolerated).")
+
+
+def _apply_edits(normalized: str, edits: list[dict], path: str,
+                 partial: bool = False) -> tuple[str, str, list[dict]]:
+    """Match and apply edits. Returns (base, new_content, per_edit_results).
+    partial=False -> any failure raises (atomic). partial=True -> skip failures, report them."""
+    norm = [{"old": _normalize_lf(e["old_text"]), "new": _normalize_lf(e["new_text"])} for e in edits]
+    used_fuzzy = any(_find(normalized, e["old"])[3] for e in norm if e["old"])
+    base = _fuzzy(normalized) if used_fuzzy else normalized
+    label = lambda i: f"edits[{i}]" if len(norm) > 1 else "the text"
+    matched, results = [], []
+    for i, e in enumerate(norm):
+        if not e["old"]:
+            if not partial:
+                raise ValueError(f"edits[{i}].old_text must not be empty in {path}.")
+            results.append({"index": i, "ok": False, "error": "old_text is empty"})
+            continue
+        try:
+            idx, mlen, newtext = _match_one(base, used_fuzzy, e["old"], e["new"], path, label(i))
+            matched.append({"i": i, "idx": idx, "len": mlen, "new": newtext})
+            results.append({"index": i, "ok": True, "error": None})
+        except ValueError as err:
+            if not partial:
+                raise
+            results.append({"index": i, "ok": False, "error": str(err)})
     matched.sort(key=lambda m: m["idx"])
     for a, b in zip(matched, matched[1:]):
         if a["idx"] + a["len"] > b["idx"]:
-            raise ValueError(f"edits[{a['i']}] and edits[{b['i']}] overlap in {path}. Merge them.")
+            msg = f"edits[{a['i']}] and edits[{b['i']}] overlap in {path}. Merge them."
+            if not partial:
+                raise ValueError(msg)
+            for r in results:
+                if r["index"] == b["i"]:
+                    r["ok"], r["error"] = False, msg
+            matched = [m for m in matched if m["i"] != b["i"]]
     new = base
-    for m in reversed(matched):
+    for m in sorted(matched, key=lambda m: m["idx"], reverse=True):
         new = new[:m["idx"]] + m["new"] + new[m["idx"] + m["len"]:]
-    if base == new:
+    if base == new and not partial:
         raise ValueError(f"No changes made to {path}. Replacement produced identical content.")
-    return base, new
+    return base, new, results
 
 
 class WriteResult(TypedDict):
@@ -223,6 +292,7 @@ class EditResult(TypedDict):
     path: str
     replacements: int
     diff: str | None
+    results: list[dict] | None
     error: str | None
 
 
@@ -250,38 +320,60 @@ def write_file(path: str, content: str) -> WriteResult:
 
 
 @mcp.tool()
-def edit_file(path: str, edits: list[EditOp]) -> EditResult:
-    """Apply one or more exact-text replacements to a file.
+def edit_file(path: str, edits: list[EditOp], dry_run: bool = False,
+              partial: bool = False) -> EditResult:
+    """Apply one or more text replacements to a file.
 
-    Each edits[].old_text must match exactly (whitespace/newlines included) and be
-    unique in the file. All edits are matched against the original content, must not
-    overlap, and are applied atomically (all-or-nothing). If exact match fails, a
-    fuzzy match is tried (trailing whitespace, smart quotes, unicode dashes/spaces).
-    Returns a line-numbered unified diff of the change.
+    Matching, tried in order per edit:
+      1. exact match
+      2. trailing-whitespace / smart-quote / unicode dash+space tolerant match
+      3. indent-insensitive match (leading whitespace ignored; new_text is
+         automatically re-indented to fit the file). Good for editing indented
+         Python/YAML blocks where exact leading spaces are hard to reproduce.
+    Each old_text must resolve to a unique location. Edits are matched against the
+    original content and must not overlap.
+
+    partial=False (default): atomic, any failed edit aborts the whole call and
+      writes nothing. partial=True: apply the edits that match, skip the rest, and
+      report per-edit status in `results`.
+    dry_run=True: do not write; just return the diff that would result.
+
+    Returns a unified diff plus a per-edit `results` list.
     """
     if not edits:
         return {"ok": False, "path": path, "replacements": 0, "diff": None,
-                "error": "edits must contain at least one replacement."}
+                "results": None, "error": "edits must contain at least one replacement."}
     try:
         p = pathlib.Path(path).expanduser()
         raw = p.read_bytes().decode("utf-8")
     except Exception as e:
-        return {"ok": False, "path": path, "replacements": 0, "diff": None, "error": str(e)}
+        return {"ok": False, "path": path, "replacements": 0, "diff": None,
+                "results": None, "error": str(e)}
     bom, text = _strip_bom(raw)
     ending = _detect_ending(text)
     normalized = _normalize_lf(text)
     try:
-        base, new = _apply_edits(normalized, edits, path)
+        base, new, results = _apply_edits(normalized, edits, path, partial=partial)
     except ValueError as e:
-        return {"ok": False, "path": str(p), "replacements": 0, "diff": None, "error": str(e)}
-    try:
-        p.write_bytes((bom + _restore_ending(new, ending)).encode("utf-8"))
-    except Exception as e:
-        return {"ok": False, "path": str(p), "replacements": 0, "diff": None, "error": str(e)}
+        return {"ok": False, "path": str(p), "replacements": 0, "diff": None,
+                "results": None, "error": str(e)}
+    applied = sum(1 for r in results if r["ok"])
     diff = "".join(difflib.unified_diff(
         base.splitlines(keepends=True), new.splitlines(keepends=True),
         fromfile=path, tofile=path, n=3))
-    return {"ok": True, "path": str(p), "replacements": len(edits), "diff": diff, "error": None}
+    if dry_run:
+        return {"ok": True, "path": str(p), "replacements": applied, "diff": diff,
+                "results": results, "error": None}
+    if base == new:
+        return {"ok": False, "path": str(p), "replacements": 0, "diff": "",
+                "results": results, "error": "No edits matched; nothing written."}
+    try:
+        p.write_bytes((bom + _restore_ending(new, ending)).encode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "path": str(p), "replacements": 0, "diff": None,
+                "results": results, "error": str(e)}
+    return {"ok": True, "path": str(p), "replacements": applied, "diff": diff,
+            "results": results, "error": None}
 
 
 @mcp.tool()
@@ -319,7 +411,12 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResul
         n += 1
     truncated = end < total
     next_off = end + 1 if truncated else None
-    return {"content": "\n".join(out), "start_line": start + 1, "end_line": start + n,
+    body = "\n".join(out)
+    if truncated:
+        remaining = total - (start + n)
+        body += (f"\n\n--- TRUNCATED: showing lines {start + 1}-{start + n} of {total} "
+                 f"({remaining} more). Use offset={next_off} to continue. ---")
+    return {"content": body, "start_line": start + 1, "end_line": start + n,
             "total_lines": total, "truncated": truncated, "next_offset": next_off, "error": None}
 
 
