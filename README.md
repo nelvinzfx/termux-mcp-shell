@@ -5,6 +5,24 @@ plus pi-grade file read/write/edit tools.
 
 ## Install
 
+### One-liner
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nelvinzfx/termux-mcp-shell/master/install.sh | sh
+```
+
+Installs python + git via `pkg`, clones the repo to `~/termux-mcp-shell`,
+installs Python deps, and (if fish is present) adds `mcpsh` / `mcpsh-stop`
+helper functions. Idempotent — safe to re-run.
+
+To use a custom destination or repo URL:
+
+```sh
+MCP_DEST=$HOME/mcp sh -c 'curl -fsSL https://raw.githubusercontent.com/nelvinzfx/termux-mcp-shell/master/install.sh | sh'
+```
+
+### Manual
+
 ```sh
 pkg install python
 pip install -r requirements.txt
