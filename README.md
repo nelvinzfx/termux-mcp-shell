@@ -56,6 +56,7 @@ Find the device IP with `ifconfig` or `ip addr`.
 | `MCP_MAX_SESSIONS`   | `50`      | output buffers kept in memory (FIFO)|
 | `MCP_READ_MAX_LINES` | `2000`    | max lines per `read_file`           |
 | `MCP_READ_MAX_BYTES` | `51200`   | max bytes per `read_file` (50KB)    |
+| `MCP_AUTH_TOKEN`     | *(unset)* | if set, require Bearer/X-API-Key auth |
 
 ## Tools
 
@@ -84,7 +85,37 @@ Find the device IP with `ifconfig` or `ip addr`.
   CRLF line endings and BOM are preserved. Returns a unified diff plus a
   per-edit `results` list.
 
+## Authentication (optional)
+
+By default the server runs **without authentication** — anyone who can reach
+the bind address can call every tool (run shell commands, read/write files).
+This is fine for loopback (`127.0.0.1`) or a private hotspot you control.
+
+To enable token auth, set `MCP_AUTH_TOKEN`:
+
+```sh
+MCP_AUTH_TOKEN="$(openssl rand -hex 32)" python server.py
+```
+
+When set, every request must include a matching token in one of two headers:
+
+| Header          | Format                  |
+|-----------------|-------------------------|
+| `Authorization` | `Bearer <token>`        |
+| `X-API-Key`     | `<token>`               |
+
+Configure your MCP client to send one of these headers. For example, in
+RikkaHub's MCP server settings, add a header `Authorization: Bearer <token>`
+or `X-API-Key: <token>`.
+
+**Risk note:** this is a single shared token — there is no per-client identity,
+rate limiting, or TLS. It prevents casual access from other devices on the same
+LAN but is **not** a substitute for proper network security. If you expose the
+server beyond a trusted network, put it behind a reverse proxy with TLS and
+real authentication.
+
 ## Security note
 
-No auth. Anyone on the same network can execute commands. Use only on a trusted
-network (your own device / private hotspot).
+Without `MCP_AUTH_TOKEN`, the server has no auth — anyone on the same network
+can execute commands. Use only on a trusted network (loopback / private
+hotspot), or set `MCP_AUTH_TOKEN` (see above).

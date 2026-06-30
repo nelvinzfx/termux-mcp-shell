@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """MCP Streamable HTTP server: full Termux shell access plus file tools."""
 import difflib
+import hmac
 import json
 import os
 import pathlib
@@ -25,6 +26,44 @@ MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "50"))
 _buffers: "OrderedDict[str, dict]" = OrderedDict()
 
 mcp = FastMCP("termux-shell", host=HOST, port=PORT)
+
+
+class AuthMiddleware:
+    """Pure-ASGI middleware: optional Bearer / X-API-Key token auth.
+
+    Active only when MCP_AUTH_TOKEN env is set. When unset, no auth is applied
+    and the server behaves exactly as before (open access on the bind address).
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._token = token.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode(errors="replace")
+        api_key = headers.get(b"x-api-key", b"").decode(errors="replace")
+        provided = ""
+        if auth.startswith("Bearer "):
+            provided = auth[7:].strip()
+        elif api_key:
+            provided = api_key.strip()
+        if not hmac.compare_digest(provided.encode(), self._token):
+            if scope["type"] == "http":
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                })
+                await send({"type": "http.response.body",
+                            "body": json.dumps({"error": "unauthorized"}).encode()})
+            return
+        await self.app(scope, receive, send)
 
 
 def _store(stdout: bytes, stderr: bytes) -> str:
@@ -441,4 +480,10 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResul
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    auth_token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+    app = mcp.streamable_http_app()
+    if auth_token:
+        app.add_middleware(AuthMiddleware, token=auth_token)
+        print(f"[auth] token auth enabled ({auth_token[:4]}...{auth_token[-4:]})")
+    import uvicorn
+    uvicorn.run(app, host=HOST, port=PORT)
