@@ -353,12 +353,13 @@ def edit_file(path: str, edits: str, dry_run: bool = False,
 
     Returns a unified diff plus a per-edit `results` list.
     """
-    # Parse edits JSON string — bypass Pydantic nested object validation
-    try:
-        edits = json.loads(edits)
-    except (json.JSONDecodeError, TypeError) as e:
-        return {"ok": False, "path": path, "replacements": 0, "diff": None,
-                "results": None, "error": f"edits is not valid JSON: {e}"}
+    # Parse edits — accept both JSON string (schema-compliant) and list (RikkaHub sends parsed JSON)
+    if isinstance(edits, str):
+        try:
+            edits = json.loads(edits)
+        except (json.JSONDecodeError, TypeError) as e:
+            return {"ok": False, "path": path, "replacements": 0, "diff": None,
+                    "results": None, "error": f"edits is not valid JSON: {e}"}
     if not isinstance(edits, list) or not edits:
         return {"ok": False, "path": path, "replacements": 0, "diff": None,
                 "results": None, "error": "edits must be a non-empty JSON array of {old_text, new_text} objects."}
