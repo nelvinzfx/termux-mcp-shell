@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """MCP Streamable HTTP server: full Termux shell access plus file tools."""
 import difflib
+import json
 import os
 import pathlib
 import re
@@ -191,21 +192,29 @@ def _find_indent(content: str, old: str) -> tuple[bool, int, int, str]:
 
 
 def _reindent(new: str, matched: str, old: str) -> str:
-    """Re-indent new_text by the indent delta between the matched block and what the model sent."""
-    def indent_of(line: str) -> str:
-        return line[: len(line) - len(line.lstrip())]
-    actual = indent_of(matched.split("\n")[0])
-    intended = indent_of(old.split("\n")[0])
+    """Re-indent new_text by the indent delta between the matched block and what the model sent.
+
+    Applies the delta to each line individually based on that line's own indent,
+    so multi-level indentation (e.g. 8sp + 12sp + 16sp) is preserved correctly.
+    """
+    def indent_len(line: str) -> int:
+        return len(line) - len(line.lstrip())
+    actual = indent_len(matched.split("\n")[0])
+    intended = indent_len(old.split("\n")[0])
     if actual == intended:
+        return new
+    delta = actual - intended
+    if delta == 0:
         return new
     out = []
     for line in new.split("\n"):
-        if line.startswith(intended):
-            out.append(actual + line[len(intended):])
-        elif not line.strip():
-            out.append(line)
-        else:
-            out.append(actual + line.lstrip())
+        stripped = line.lstrip()
+        if not stripped:  # blank or whitespace-only line — preserve as empty
+            out.append("")
+            continue
+        current = indent_len(line)
+        new_indent = max(0, current + delta)
+        out.append(" " * new_indent + stripped)
     return "\n".join(out)
 
 
@@ -320,9 +329,13 @@ def write_file(path: str, content: str) -> WriteResult:
 
 
 @mcp.tool()
-def edit_file(path: str, edits: list[EditOp], dry_run: bool = False,
+def edit_file(path: str, edits: str, dry_run: bool = False,
               partial: bool = False) -> EditResult:
     """Apply one or more text replacements to a file.
+
+    edits is a JSON string: [{"old_text": "...", "new_text": "..."}, ...]
+    Passing a JSON string instead of a nested object array avoids MCP transport
+    serialization issues with long strings containing newlines and backslashes.
 
     Matching, tried in order per edit:
       1. exact match
@@ -340,9 +353,15 @@ def edit_file(path: str, edits: list[EditOp], dry_run: bool = False,
 
     Returns a unified diff plus a per-edit `results` list.
     """
-    if not edits:
+    # Parse edits JSON string — bypass Pydantic nested object validation
+    try:
+        edits = json.loads(edits)
+    except (json.JSONDecodeError, TypeError) as e:
         return {"ok": False, "path": path, "replacements": 0, "diff": None,
-                "results": None, "error": "edits must contain at least one replacement."}
+                "results": None, "error": f"edits is not valid JSON: {e}"}
+    if not isinstance(edits, list) or not edits:
+        return {"ok": False, "path": path, "replacements": 0, "diff": None,
+                "results": None, "error": "edits must be a non-empty JSON array of {old_text, new_text} objects."}
     try:
         p = pathlib.Path(path).expanduser()
         raw = p.read_bytes().decode("utf-8")
