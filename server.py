@@ -329,7 +329,7 @@ def write_file(path: str, content: str) -> WriteResult:
 
 
 @mcp.tool()
-def edit_file(path: str, edits: str, dry_run: bool = False,
+def edit_file(path: str, edits: "str | list", dry_run: bool = False,
               partial: bool = False) -> EditResult:
     """Apply one or more text replacements to a file.
 
