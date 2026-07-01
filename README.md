@@ -1,7 +1,6 @@
 # termux-mcp-shell
 
-MCP server (Streamable HTTP) that gives an agent full shell access on Termux,
-plus pi-grade file read/write/edit tools.
+MCP server (Streamable HTTP) that gives an agent full shell access on Termux.
 
 ## Install
 
@@ -13,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/nelvinzfx/termux-mcp-shell/master/i
 
 Installs python + git via `pkg`, clones the repo to `~/termux-mcp-shell`,
 installs Python deps, and (if fish is present) adds `mcpsh` / `mcpsh-stop`
-helper functions. Idempotent — safe to re-run.
+helper functions. Idempotent, safe to re-run.
 
 To use a custom destination or repo URL:
 
@@ -87,7 +86,7 @@ Find the device IP with `ifconfig` or `ip addr`.
 
 ## Authentication (optional)
 
-By default the server runs **without authentication** — anyone who can reach
+By default the server runs **without authentication**; anyone who can reach
 the bind address can call every tool (run shell commands, read/write files).
 This is fine for loopback (`127.0.0.1`) or a private hotspot you control.
 
@@ -108,7 +107,7 @@ Configure your MCP client to send one of these headers. For example, in
 RikkaHub's MCP server settings, add a header `Authorization: Bearer <token>`
 or `X-API-Key: <token>`.
 
-**Risk note:** this is a single shared token — there is no per-client identity,
+**Risk note:** this is a single shared token; there is no per-client identity,
 rate limiting, or TLS. It prevents casual access from other devices on the same
 LAN but is **not** a substitute for proper network security. If you expose the
 server beyond a trusted network, put it behind a reverse proxy with TLS and
@@ -116,6 +115,6 @@ real authentication.
 
 ## Security note
 
-Without `MCP_AUTH_TOKEN`, the server has no auth — anyone on the same network
+Without `MCP_AUTH_TOKEN`, the server has no auth; anyone on the same network
 can execute commands. Use only on a trusted network (loopback / private
 hotspot), or set `MCP_AUTH_TOKEN` (see above).
