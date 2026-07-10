@@ -1,0 +1,42 @@
+#!/data/data/com.termux/files/usr/bin/sh
+set -eu
+PIDFILE="$HOME/.mcpsh.pid"
+PORT="${MCP_PORT:-8088}"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Already running?
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "mcpsh already running (PID $(cat "$PIDFILE"))"
+    exit 1
+fi
+
+# Start in background, immune to SIGHUP (survives tab close)
+nohup python "$SCRIPT_DIR/server.py" > "$HOME/.mcpsh.log" 2>&1 &
+echo $! > "$PIDFILE"
+
+sleep 1
+
+if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    PID=$(cat "$PIDFILE")
+    echo "mcpsh started (PID $PID)"
+    echo "  log: ~/.mcpsh.log"
+    echo ""
+    echo "  MCP endpoints:"
+    echo "    local: http://127.0.0.1:$PORT/mcp"
+    # Detect LAN IP
+    LAN_IP=""
+    if command -v ifconfig >/dev/null 2>&1; then
+        LAN_IP=$(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1)
+    elif command -v ip >/dev/null 2>&1; then
+        LAN_IP=$(ip addr 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+    fi
+    if [ -n "$LAN_IP" ]; then
+        echo "    LAN:   http://$LAN_IP:$PORT/mcp"
+    else
+        echo "    LAN:   (could not auto-detect, run: ifconfig)"
+    fi
+else
+    echo "mcpsh failed to start, check ~/.mcpsh.log"
+    rm -f "$PIDFILE"
+    exit 1
+fi

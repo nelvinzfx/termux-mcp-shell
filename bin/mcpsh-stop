@@ -1,0 +1,16 @@
+#!/data/data/com.termux/files/usr/bin/sh
+PIDFILE="$HOME/.mcpsh.pid"
+if [ -f "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        kill "$PID"
+        sleep 0.5
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+        echo "mcpsh stopped (PID $PID)"
+    else
+        echo "mcpsh not running (stale pidfile)"
+    fi
+    rm -f "$PIDFILE"
+else
+    pkill -f "server.py" 2>/dev/null && echo "mcpsh stopped" || echo "mcpsh not running"
+fi
