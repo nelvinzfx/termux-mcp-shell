@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import difflib
+import functools
 import hashlib
 import hmac
 import json
@@ -43,6 +44,24 @@ _PLAN_LOCK = threading.Lock()
 _TRANSACTION_LOCK = threading.RLock()
 
 mcp = FastMCP("termux-shell", host=HOST, port=PORT)
+
+
+def _threaded_tool(fn):
+    """Register blocking filesystem work off the ASGI event loop."""
+    @functools.wraps(fn)
+    async def call(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    mcp.tool()(call)
+    return fn
+
+
+def _serialized_threaded_tool(fn):
+    """Offload a mutating tool while preserving write transaction ordering."""
+    @functools.wraps(fn)
+    def call(*args, **kwargs):
+        with _TRANSACTION_LOCK:
+            return fn(*args, **kwargs)
+    return _threaded_tool(call)
 
 
 class AuthMiddleware:
@@ -565,7 +584,7 @@ def _atomic_write(p: pathlib.Path, data: bytes) -> None:
         raise
 
 
-@mcp.tool()
+@_serialized_threaded_tool
 def write_file(path: str, content: str, sha256: str | None = None) -> WriteResult:
     """Atomically write UTF-8 content, creating parent directories; optionally verify SHA-256."""
     try:
@@ -579,7 +598,7 @@ def write_file(path: str, content: str, sha256: str | None = None) -> WriteResul
         return {"ok": False, "path": path, "bytes_written": 0, "sha256": None, "error": str(e)}
 
 
-@mcp.tool()
+@_serialized_threaded_tool
 def append_file(path: str, content: str, sha256: str | None = None) -> WriteResult:
     """Atomically append UTF-8 content, creating the file and parent directories if needed."""
     try:
@@ -620,7 +639,7 @@ class ReadResult2(TypedDict):
     error: str | None
 
 
-@mcp.tool()
+@_serialized_threaded_tool
 def edit_file(path: str, edits: "str | list", dry_run: bool = False,
               partial: bool = False, expected_sha256: str | None = None) -> EditResult:
     """Atomically apply replacements; accepts legacy JSON-string or native-array edits.
@@ -668,7 +687,7 @@ def edit_file(path: str, edits: "str | list", dry_run: bool = False,
     return {"ok": True, "path": str(p), "replacements": applied, "changed": True, "diff": diff, "results": results, "batch_aborted": False, "error": None}
 
 
-@mcp.tool()
+@_threaded_tool
 def read_file_bytes(path: str, offset: int = 0, length: int = 4096) -> dict:
     """Read a byte range, returning base64 data so binary and minified files are safe."""
     if offset < 0 or length < 0:
@@ -681,14 +700,8 @@ def read_file_bytes(path: str, offset: int = 0, length: int = 4096) -> dict:
         return {"ok": False, "path": path, "offset": offset, "length": 0, "total_bytes": 0, "eof": True, "data_base64": "", "error": str(e)}
 
 
-@mcp.tool()
-def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResult2:
-    """Read a text file with 1-indexed line numbers (cat -n style).
-
-    Returns sha256 of the exact file bytes. offset = 1-indexed line to start
-    from. limit = max lines (default: until the 2000-line / 50KB cap). Use
-    next_offset from the result to continue large files.
-    """
+def _read_file(path: str, offset: int = 1, limit: int | None = None,
+               line_numbers: bool = True) -> ReadResult2:
     try:
         p = pathlib.Path(path).expanduser()
         raw_bytes = p.read_bytes()
@@ -698,7 +711,8 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResul
         return {"content": "", "start_line": offset, "end_line": 0, "total_lines": 0,
                 "truncated": False, "next_offset": None, "sha256": None, "error": str(e)}
     lines = text.split("\n")
-    if lines and lines[-1] == "":
+    final_newline = bool(lines and lines[-1] == "")
+    if final_newline:
         lines.pop()
     total = len(lines)
     start = max(0, offset - 1)
@@ -710,8 +724,13 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResul
     end = min(end, start + READ_MAX_LINES)
     out, size, n = [], 0, 0
     for idx in range(start, end):
-        row = f"{idx + 1:6d}  {lines[idx]}"
-        size += len(row.encode()) + 1
+        if line_numbers:
+            row = f"{idx + 1:6d}  {lines[idx]}"
+            row_size = len(row.encode()) + 1
+        else:
+            row = lines[idx] + ("\n" if idx < total - 1 or final_newline else "")
+            row_size = len(row.encode())
+        size += row_size
         if n > 0 and size > READ_MAX_BYTES:
             end = start + n
             break
@@ -719,14 +738,66 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> ReadResul
         n += 1
     truncated = end < total
     next_off = end + 1 if truncated else None
-    body = "\n".join(out)
-    if truncated:
+    body = "\n".join(out) if line_numbers else "".join(out)
+    if truncated and line_numbers:
         remaining = total - (start + n)
         body += (f"\n\n--- TRUNCATED: showing lines {start + 1}-{start + n} of {total} "
                  f"({remaining} more). Use offset={next_off} to continue. ---")
     return {"content": body, "start_line": start + 1, "end_line": start + n,
             "total_lines": total, "truncated": truncated, "next_offset": next_off,
             "sha256": sha256, "error": None}
+
+
+@_threaded_tool
+def read_file(path: str, offset: int = 1, limit: int | None = None,
+              line_numbers: bool = True) -> ReadResult2:
+    """Read paginated UTF-8 text; set line_numbers=false for exact raw text.
+
+    Returns sha256 of the exact file bytes. offset is 1-indexed and limit caps
+    lines before the server's line/byte limits. Use next_offset to continue.
+    """
+    return _read_file(path, offset, limit, line_numbers)
+
+
+@_threaded_tool
+def read_files(reads: "str | list") -> dict:
+    """Batch-read up to 20 text-file ranges in input order.
+
+    Each item accepts path, offset, limit, and line_numbers with read_file
+    semantics. Pass a native array or JSON-encoded array.
+    """
+    if isinstance(reads, str):
+        try:
+            reads = json.loads(reads)
+        except (json.JSONDecodeError, TypeError) as e:
+            return {"results": [], "error": f"reads is not valid JSON: {e}"}
+    if not isinstance(reads, list) or not reads:
+        return {"results": [], "error": "reads must be a non-empty array"}
+    if len(reads) > 20:
+        return {"results": [], "error": "reads accepts at most 20 items"}
+
+    normalized = []
+    for i, item in enumerate(reads):
+        if not isinstance(item, dict):
+            return {"results": [], "error": f"reads[{i}] must be an object"}
+        path = item.get("path")
+        offset = item.get("offset", 1)
+        limit = item.get("limit")
+        line_numbers = item.get("line_numbers", True)
+        if not isinstance(path, str) or not path:
+            return {"results": [], "error": f"reads[{i}].path is required"}
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+            return {"results": [], "error": f"reads[{i}].offset must be a positive integer"}
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            return {"results": [], "error": f"reads[{i}].limit must be a positive integer or null"}
+        if not isinstance(line_numbers, bool):
+            return {"results": [], "error": f"reads[{i}].line_numbers must be boolean"}
+        normalized.append((path, offset, limit, line_numbers))
+
+    return {"results": [
+        {"path": path, **_read_file(path, offset, limit, line_numbers)}
+        for path, offset, limit, line_numbers in normalized
+    ], "error": None}
 
 
 # ---------------------------------------------------------------------------
@@ -1160,7 +1231,7 @@ def _apply_plan_by_id(plan_id: str, dry_run: bool, return_diff: bool) -> dict:
                           error=None, plan_id=plan_id)
 
 
-@mcp.tool()
+@_threaded_tool
 def edit_files(files: "str | list | None" = None, dry_run: bool = False,
                return_diff: bool = True, validate_all: bool = True,
                create_plan: bool = False,

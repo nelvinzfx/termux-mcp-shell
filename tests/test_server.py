@@ -3,7 +3,9 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
 import shlex
+import time
 import threading
 
 import server
@@ -169,6 +171,72 @@ def test_read_file_sha256_none_on_error(tmp_path):
     result = server.read_file(str(tmp_path / "nonexistent.txt"))
     assert result["sha256"] is None
     assert result["error"]
+
+
+def test_read_file_raw_preserves_exact_selected_text(tmp_path):
+    path = tmp_path / "raw.txt"
+    path.write_bytes(b"alpha\r\n  beta\r\ngamma")
+
+    result = server.read_file(str(path), offset=1, limit=2, line_numbers=False)
+
+    assert result["content"] == "alpha\r\n  beta\r\n"
+    assert result["truncated"] is True
+    assert result["next_offset"] == 3
+    assert result["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_read_files_batches_ranges_and_item_errors(tmp_path):
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("one\ntwo\n")
+    second.write_text("three\nfour\n")
+
+    result = server.read_files([
+        {"path": str(first), "limit": 1, "line_numbers": False},
+        {"path": str(second), "offset": 2},
+        {"path": str(tmp_path / "missing.txt")},
+    ])
+
+    assert result["error"] is None
+    assert result["results"][0]["content"] == "one\n"
+    assert "four" in result["results"][1]["content"]
+    assert result["results"][2]["error"]
+    assert [item["path"] for item in result["results"]] == [
+        str(first), str(second), str(tmp_path / "missing.txt")]
+
+
+def test_filesystem_tools_are_registered_async():
+    names = ("write_file", "append_file", "edit_file", "read_file_bytes",
+             "read_file", "read_files", "edit_files")
+    assert all(server.mcp._tool_manager._tools[name].is_async for name in names)
+
+
+def test_slow_read_file_does_not_block_event_loop(tmp_path, monkeypatch):
+    path = tmp_path / "slow.txt"
+    path.write_text("ready\n")
+    original = pathlib.Path.read_bytes
+
+    def slow_read_bytes(self):
+        if self == path:
+            time.sleep(0.3)
+        return original(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", slow_read_bytes)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        task = asyncio.create_task(
+            server.mcp.call_tool("read_file", {"path": str(path)}))
+        await asyncio.sleep(0.05)
+        elapsed = loop.time() - started
+        assert not task.done()
+        _, result = await task
+        return elapsed, result
+
+    elapsed, result = asyncio.run(scenario())
+    assert elapsed < 0.2
+    assert "ready" in result["content"]
 
 
 # ---------------------------------------------------------------------------

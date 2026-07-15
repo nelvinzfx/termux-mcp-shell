@@ -89,11 +89,13 @@ FIFO-evicted after `MCP_MAX_SESSIONS` entries.
 
 ### Reading files
 
-#### `read_file(path, offset=1, limit=null)`
+#### `read_file(path, offset=1, limit=null, line_numbers=true)`
 
-Returns line-numbered UTF-8 text, pagination metadata, and `sha256`, calculated
-from the exact current file bytes. `offset` is 1-indexed. Large files are capped
-by `MCP_READ_MAX_LINES` and `MCP_READ_MAX_BYTES`; use `next_offset` to continue.
+Returns paginated UTF-8 text, metadata, and `sha256`, calculated from the exact
+current file bytes. `offset` is 1-indexed. Set `line_numbers=false` for raw text
+that preserves line endings and can be copied into exact edits. Large files are
+capped by `MCP_READ_MAX_LINES` and `MCP_READ_MAX_BYTES`; use `next_offset` to
+continue.
 
 The returned hash can protect a later edit from overwriting concurrent changes:
 
@@ -113,10 +115,20 @@ The returned hash can protect a later edit from overwriting concurrent changes:
 }
 ```
 
+#### `read_files(reads)`
+
+Batch-reads up to 20 text-file ranges in input order. Each item accepts `path`,
+`offset`, `limit`, and `line_numbers` with the same semantics as `read_file`.
+Missing files return item-level errors without discarding successful reads.
+
 #### `read_file_bytes(path, offset=0, length=4096)`
 
 Returns an arbitrary byte range as Base64. Use it for binary, minified, or
 otherwise unsuitable text files.
+
+Filesystem tools run in worker threads so slow storage and hashing do not block
+unrelated MCP requests. Mutating tools remain serialized to preserve transaction
+ordering.
 
 ### Writing files
 
