@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """MCP Streamable HTTP server: full Termux shell access plus file tools."""
+import asyncio
 import base64
 import difflib
 import hashlib
@@ -8,7 +9,7 @@ import json
 import os
 import pathlib
 import re
-import subprocess
+import signal
 import tempfile
 import threading
 import time
@@ -120,19 +121,40 @@ class ReadResult(TypedDict):
     error: str | None
 
 
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill the command's isolated process group, including descendants."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if proc.returncode is None:
+            proc.kill()
+
+
 @mcp.tool()
-def run_command(command: str, timeout: float | None = None, cwd: str | None = None) -> RunResult:
+async def run_command(command: str, timeout: float | None = None,
+                      cwd: str | None = None) -> RunResult:
     """Run a shell command via /bin/sh -c and return stdout/stderr/exit_code.
 
     Long output is truncated to MCP_TRUNC_LIMIT bytes; full output is kept in a
     buffer readable via read_output using the returned session_id.
     """
+    spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
+        command, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        executable="/bin/sh", start_new_session=True,
+    ))
     try:
-        proc = subprocess.Popen(
-            command, shell=True, cwd=cwd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            executable="/bin/sh",
-        )
+        proc = await asyncio.shield(spawn_task)
+    except asyncio.CancelledError as cancelled:
+        try:
+            proc = await asyncio.shield(spawn_task)
+        except Exception:
+            raise cancelled
+        _kill_process_group(proc)
+        await asyncio.shield(proc.communicate())
+        raise
     except Exception as e:
         return {"error": f"spawn failed: {e}", "exit_code": None, "timed_out": False,
                 "stdout": "", "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
@@ -140,12 +162,21 @@ def run_command(command: str, timeout: float | None = None, cwd: str | None = No
                 "stdout_next_offset": None, "stderr_next_offset": None}
 
     timed_out = False
+    communicate_task = asyncio.create_task(proc.communicate())
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate()
-        timed_out = True
+        done, _ = await asyncio.wait({communicate_task}, timeout=timeout)
+        if communicate_task in done:
+            out, err = communicate_task.result()
+        else:
+            timed_out = True
+            _kill_process_group(proc)
+            out, err = await asyncio.shield(communicate_task)
+    except asyncio.CancelledError:
+        _kill_process_group(proc)
+        try:
+            await asyncio.shield(communicate_task)
+        finally:
+            raise
 
     out_s, out_trunc, out_total = _head(out)
     err_s, err_trunc, err_total = _head(err)

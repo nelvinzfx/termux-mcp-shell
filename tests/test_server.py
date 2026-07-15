@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import hashlib
 import json
 import os
+import shlex
 import threading
 
 import server
@@ -83,13 +85,72 @@ def test_write_file_sha256_and_atomic_payload(tmp_path):
 
 def test_run_command_truncation_has_next_offsets(monkeypatch):
     monkeypatch.setattr(server, "TRUNC_LIMIT", 3)
-    result = server.run_command("printf 123456; printf abcdef >&2")
+    result = asyncio.run(server.run_command("printf 123456; printf abcdef >&2"))
     assert result["stdout_truncated"] is True
     assert result["stderr_truncated"] is True
     assert result["stdout_next_offset"] == 3
     assert result["stderr_next_offset"] == 3
     assert result["session_id"]
     assert server.read_output(result["session_id"], "stdout", 3, 3)["data"] == "456"
+
+
+def test_long_run_command_does_not_block_concurrent_read_file(tmp_path):
+    path = tmp_path / "ready.txt"
+    path.write_text("ready\n")
+
+    async def scenario():
+        command_task = asyncio.create_task(
+            server.mcp.call_tool("run_command", {"command": "sleep 0.5"}))
+        await asyncio.sleep(0.05)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        _, read_result = await asyncio.wait_for(
+            server.mcp.call_tool("read_file", {"path": str(path)}), timeout=0.2)
+        elapsed = loop.time() - started
+        assert not command_task.done()
+        _, command_result = await command_task
+        return read_result, elapsed, command_result
+
+    read_result, elapsed, command_result = asyncio.run(scenario())
+    assert read_result["error"] is None
+    assert "ready" in read_result["content"]
+    assert elapsed < 0.2
+    assert command_result["exit_code"] == 0
+
+
+def test_run_command_timeout_kills_process_group(tmp_path):
+    side_effect = tmp_path / "timeout-leak.txt"
+    command = f"(sleep 0.4; printf leaked > {shlex.quote(str(side_effect))}) & wait"
+
+    async def scenario():
+        result = await server.run_command(command, timeout=0.05)
+        await asyncio.sleep(0.5)
+        return result
+
+    result = asyncio.run(scenario())
+    assert result["timed_out"] is True
+    assert result["exit_code"] is not None
+    assert not side_effect.exists()
+
+
+def test_run_command_cancellation_kills_process_group(tmp_path):
+    side_effect = tmp_path / "cancel-leak.txt"
+    command = f"(sleep 0.4; printf leaked > {shlex.quote(str(side_effect))}) & wait"
+
+    async def scenario():
+        task = asyncio.create_task(server.run_command(command))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("run_command did not propagate cancellation")
+        await asyncio.sleep(0.5)
+
+    asyncio.run(scenario())
+    assert not side_effect.exists()
 
 
 # ---------------------------------------------------------------------------
