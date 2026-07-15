@@ -16,18 +16,20 @@ import threading
 import unicodedata
 import uuid
 from collections import OrderedDict
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 READ_MAX_LINES = int(os.environ.get("MCP_READ_MAX_LINES", "2000"))
 READ_MAX_BYTES = int(os.environ.get("MCP_READ_MAX_BYTES", str(50 * 1024)))
 
-HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8088"))
 TRUNC_LIMIT = int(os.environ.get("MCP_TRUNC_LIMIT", "8192"))
 MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "50"))
 TEMP_ROOT = pathlib.Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
+HOME_ROOT = pathlib.Path(os.environ.get("HOME") or pathlib.Path.home()).expanduser().resolve()
 
 
 # session_id -> {"stdout": bytes, "stderr": bytes}
@@ -40,16 +42,16 @@ mcp = FastMCP("termux-shell", host=HOST, port=PORT)
 
 
 def _tool_path(path: str) -> pathlib.Path:
-    """Map Android's missing /tmp namespace to Termux's writable TMPDIR."""
+    """Resolve file paths against HOME and map Android's missing /tmp."""
+    if path == "/tmp" or path.startswith("/tmp/"):
+        root = TEMP_ROOT.resolve(strict=False)
+        relative = pathlib.PurePosixPath(path).relative_to("/tmp")
+        mapped = root.joinpath(*relative.parts).resolve(strict=False)
+        if mapped != root and root not in mapped.parents:
+            raise ValueError("/tmp path escapes the temporary directory")
+        return mapped
     expanded = pathlib.Path(path).expanduser()
-    if path != "/tmp" and not path.startswith("/tmp/"):
-        return expanded
-    root = TEMP_ROOT.resolve(strict=False)
-    relative = pathlib.PurePosixPath(path).relative_to("/tmp")
-    mapped = root.joinpath(*relative.parts).resolve(strict=False)
-    if mapped != root and root not in mapped.parents:
-        raise ValueError("/tmp path escapes the temporary directory")
-    return mapped
+    return expanded if expanded.is_absolute() else HOME_ROOT / expanded
 
 
 def _threaded_tool(fn):
@@ -146,6 +148,101 @@ class ReadResult(TypedDict):
     error: str | None
 
 
+_CANONICAL_MODES = ("replace_match", "insert_before", "insert_after")
+_MODE_ALIASES = {
+    "insert_before_match": "insert_before",
+    "insert_after_match": "insert_after",
+}
+_LEGACY_EDIT_KEYS = {"old_text", "new_text", "oldText", "newText"}
+_EDIT_CONTRACT = (
+    "required fields: mode, match_text (or matchText), and write_text (or writeText); "
+    "allowed canonical modes: replace_match, insert_before, insert_after; accepted mode "
+    "aliases: insert_before_match, insert_after_match. old_text/new_text and "
+    "oldText/newText are unsupported"
+)
+
+
+class EditSpec(BaseModel):
+    """One canonical text edit. Camel-case field aliases are accepted as input."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["replace_match", "insert_before", "insert_after"] = Field(
+        description=("Canonical mode. Compatibility input also accepts "
+                     "insert_before_match and insert_after_match."))
+    match_text: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("match_text", "matchText"),
+        description="Unique non-empty source or anchor; matchText is accepted as input.")
+    write_text: str = Field(
+        validation_alias=AliasChoices("write_text", "writeText"),
+        description="Literal replacement/insertion; writeText is accepted as input.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compatibility_input(cls, value):
+        if not isinstance(value, dict):
+            return value
+        legacy = sorted(_LEGACY_EDIT_KEYS.intersection(value))
+        if legacy:
+            raise ValueError(f"unsupported fields {legacy}: {_EDIT_CONTRACT}")
+        data = dict(value)
+        for canonical, alias in (("match_text", "matchText"),
+                                 ("write_text", "writeText")):
+            if canonical in data and alias in data and data[canonical] != data[alias]:
+                raise ValueError(
+                    f"conflicting values for {canonical} and {alias}; {_EDIT_CONTRACT}")
+            if canonical not in data and alias in data:
+                data[canonical] = data[alias]
+            data.pop(alias, None)
+        missing = [
+            name for name, alias in (("mode", None), ("match_text", "matchText"),
+                                     ("write_text", "writeText"))
+            if name not in data and (alias is None or alias not in data)
+        ]
+        if missing:
+            raise ValueError(f"missing {', '.join(missing)}; {_EDIT_CONTRACT}")
+        mode = data.get("mode")
+        if mode in _MODE_ALIASES:
+            data["mode"] = _MODE_ALIASES[mode]
+        elif mode not in _CANONICAL_MODES:
+            raise ValueError(f"invalid mode {mode!r}; {_EDIT_CONTRACT}")
+        return data
+
+
+class EditFileSpec(BaseModel):
+    """One existing UTF-8 file in an edit_files transaction."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    path: str
+    edits: list[EditSpec] = Field(min_length=1)
+    expected_sha256: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_edits(cls, value):
+        if isinstance(value, dict) and "edits" not in value:
+            if "content" in value:
+                raise ValueError(
+                    "edit_files edits existing UTF-8 files and requires a non-empty edits "
+                    "array; use write_file to create or replace a file")
+            raise ValueError(
+                "edit_files requires each item to contain path and a non-empty edits array")
+        return value
+
+
+class ReadFileSpec(BaseModel):
+    """One range in a read_files batch."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    path: str
+    offset: int = 1
+    limit: int | None = None
+    line_numbers: bool = True
+
+
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     """Kill the command's isolated process group, including descendants."""
     try:
@@ -163,11 +260,13 @@ async def run_command(command: str, timeout: float | None = None,
     """Run a shell command via /bin/sh -c and return stdout/stderr/exit_code.
 
     Long output is truncated to MCP_TRUNC_LIMIT bytes; full output is kept in a
-    buffer readable via read_output using the returned session_id. A cwd under
-    /tmp is mapped to Termux's TMPDIR; command text is not rewritten.
+    buffer readable via read_output using the returned session_id. Omitted cwd
+    defaults to HOME; relative cwd resolves from HOME. A cwd under /tmp maps to
+    Termux's TMPDIR. Command text is never rewritten: use $TMPDIR/... or a resolved
+    path returned by a file tool when crossing from file tools into shell commands.
     """
     try:
-        resolved_cwd = str(_tool_path(cwd)) if cwd is not None else None
+        resolved_cwd = str(_tool_path(cwd)) if cwd is not None else str(HOME_ROOT)
         spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
             command, cwd=resolved_cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -443,24 +542,47 @@ def _match_one(base: str, old: str, new: str, path: str, label: str):
 # Edit normalisation and resolution
 # ---------------------------------------------------------------------------
 
-def _normalize_edit(e: dict) -> dict:
-    """Validate one explicit edit spec and normalise line endings."""
+def _normalize_edit(e: dict | EditSpec) -> dict:
+    """Validate one explicit edit spec, accept aliases, and normalize output."""
+    if isinstance(e, BaseModel):
+        e = e.model_dump()
     if not isinstance(e, dict):
-        raise ValueError("edit must be an object")
+        raise ValueError(f"edit must be an object; {_EDIT_CONTRACT}")
+    legacy = sorted(_LEGACY_EDIT_KEYS.intersection(e))
+    if legacy:
+        raise ValueError(f"unsupported fields {legacy}: {_EDIT_CONTRACT}")
+    supported = {"mode", "match_text", "matchText", "write_text", "writeText"}
+    unknown = sorted(set(e).difference(supported))
+    if unknown:
+        raise ValueError(f"unsupported fields {unknown}: {_EDIT_CONTRACT}")
+
+    def aliased(canonical: str, alias: str):
+        if canonical in e and alias in e and e[canonical] != e[alias]:
+            raise ValueError(
+                f"conflicting values for {canonical} and {alias}; {_EDIT_CONTRACT}")
+        if canonical in e:
+            return e[canonical]
+        if alias in e:
+            return e[alias]
+        raise ValueError(f"missing {canonical}; {_EDIT_CONTRACT}")
+
     mode = e.get("mode")
-    if mode not in ("replace_match", "insert_before", "insert_after"):
-        raise ValueError(f"unknown edit mode: {mode!r}")
-    match_text = e.get("match_text", "")
-    write_text = e.get("write_text", "")
+    if mode in _MODE_ALIASES:
+        mode = _MODE_ALIASES[mode]
+    elif mode not in _CANONICAL_MODES:
+        raise ValueError(f"invalid mode {mode!r}; {_EDIT_CONTRACT}")
+    match_text = aliased("match_text", "matchText")
+    write_text = aliased("write_text", "writeText")
     if not isinstance(match_text, str) or not isinstance(write_text, str):
-        raise ValueError("match_text and write_text must be strings")
+        raise ValueError(f"match and write values must be strings; {_EDIT_CONTRACT}")
     if not match_text:
-        raise ValueError("match_text must be non-empty")
+        raise ValueError(f"match_text/matchText must be non-empty; {_EDIT_CONTRACT}")
     return {
         "mode": mode,
         "match_text": _normalize_lf(match_text),
         "write_text": _normalize_lf(write_text),
     }
+
 
 def _resolve_insert(base: str, mode: str, anchor: str,
                     content: str, path: str, label: str) -> tuple[int, int, str]:
@@ -639,10 +761,44 @@ def _atomic_write(p: pathlib.Path, data: bytes) -> None:
 
 
 @_serialized_threaded_tool
-def write_file(path: str, content: str) -> WriteResult:
-    """Atomically write UTF-8 content, creating parents; /tmp maps to Termux TMPDIR."""
+def write_file(path: str, content: str, expected_sha256: str | None = None,
+               create_only: bool = False) -> WriteResult:
+    """Atomically create or replace one UTF-8 file, creating parent directories.
+
+    Relative paths resolve from HOME; /tmp maps to Termux TMPDIR. With
+    expected_sha256, the existing file must match that hash (case-insensitive), and
+    a missing target is stale. With create_only=true, an existing target is rejected.
+    Guards and publication run under the serialized transaction lock.
+    """
     try:
         p = _tool_path(path)
+        if expected_sha256 is not None and not isinstance(expected_sha256, str):
+            raise ValueError("expected_sha256 must be a string or null")
+        if not isinstance(create_only, bool):
+            raise ValueError("create_only must be boolean")
+        if create_only and expected_sha256 is not None:
+            raise ValueError("create_only and expected_sha256 cannot be combined")
+        exists = p.exists()
+        path_entry_exists = exists or p.is_symlink()
+        if create_only and path_entry_exists:
+            current_sha = None
+            if exists and p.is_file():
+                current_sha = hashlib.sha256(p.read_bytes()).hexdigest()
+            return {"ok": False, "path": str(p), "bytes_written": 0,
+                    "sha256": current_sha,
+                    "error": "create_only target already exists"}
+        if expected_sha256 is not None:
+            if not exists:
+                return {"ok": False, "path": str(p), "bytes_written": 0,
+                        "sha256": None,
+                        "error": ("stale source: expected_sha256 supplied but target "
+                                  "does not exist")}
+            current_sha = hashlib.sha256(p.read_bytes()).hexdigest()
+            if not hmac.compare_digest(expected_sha256.lower(), current_sha):
+                return {"ok": False, "path": str(p), "bytes_written": 0,
+                        "sha256": current_sha,
+                        "error": (f"stale source: expected sha256 {expected_sha256}, "
+                                  f"got {current_sha}")}
         data = content.encode("utf-8")
         _atomic_write(p, data)
         return {
@@ -785,18 +941,24 @@ def read_file(path: str, offset: int = 1, limit: int | None = None,
               line_numbers: bool = True) -> ReadResult2:
     """Read paginated UTF-8 text; /tmp maps to Termux TMPDIR.
 
-    Returns sha256 of the exact file bytes. offset is 1-indexed and limit caps
-    lines before the server's line/byte limits. Use next_offset to continue.
+    Relative paths resolve from HOME; /tmp maps to Termux TMPDIR. Returns sha256
+    of the exact file bytes. offset is 1-indexed and limit caps lines before the
+    server limits. line_numbers defaults true; its prefixes are display-only and
+    must never be copied into edit match_text. Use line_numbers=false when copying
+    source for edits, and use next_offset to continue.
     """
     return _read_file(path, offset, limit, line_numbers)
 
 
 @_threaded_tool
-def read_files(reads: list) -> dict:
+def read_files(reads: list[ReadFileSpec]) -> dict:
     """Batch-read up to 20 text-file ranges in input order.
 
-    Each item accepts path, offset, limit, and line_numbers with read_file
-    semantics. Pass a native array.
+    Each item is {path: str, offset: int=1, limit: int|null=null,
+    line_numbers: bool=true}. Relative paths resolve from HOME; /tmp maps to
+    Termux TMPDIR. Number prefixes are display-only and must not be copied into
+    edit match_text; use line_numbers=false to copy exact source. Each result has
+    exact-byte sha256 for stale-write guards.
     """
     if not isinstance(reads, list) or not reads:
         return {"results": [], "error": "reads must be a non-empty array"}
@@ -805,6 +967,8 @@ def read_files(reads: list) -> dict:
 
     normalized = []
     for i, item in enumerate(reads):
+        if isinstance(item, BaseModel):
+            item = item.model_dump()
         if not isinstance(item, dict):
             return {"results": [], "error": f"reads[{i}] must be an object"}
         path = item.get("path")
@@ -954,6 +1118,8 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
     """Validate every file, then preview or publish one atomic transaction."""
     normalized_specs = []
     for index, spec in enumerate(file_specs):
+        if isinstance(spec, BaseModel):
+            spec = spec.model_dump()
         if not isinstance(spec, dict):
             return _tx_error(f"files[{index}] must be an object")
         path = spec.get("path")
@@ -962,7 +1128,12 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
         if not isinstance(path, str) or not path:
             return _tx_error(f"files[{index}].path is required")
         if not isinstance(edits, list) or not edits:
-            return _tx_error(f"files[{index}].edits must be a non-empty array")
+            if "content" in spec:
+                return _tx_error(
+                    f"files[{index}] edits existing UTF-8 files and requires a non-empty "
+                    "edits array; use write_file to create or replace a file")
+            return _tx_error(
+                f"files[{index}].edits must be a non-empty array; {_EDIT_CONTRACT}")
         if expected_sha is not None and not isinstance(expected_sha, str):
             return _tx_error(f"files[{index}].expected_sha256 must be a string or null")
         normalized_specs.append({
@@ -1043,9 +1214,19 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
     return _tx_result(file_data, dry_run=False, applied=True, error=None)
 
 @_serialized_threaded_tool
-def edit_file(path: str, edits: list, dry_run: bool = False,
+def edit_file(path: str, edits: list[EditSpec], dry_run: bool = False,
               expected_sha256: str | None = None) -> EditResult:
-    """Atomically edit one UTF-8 file; /tmp maps to Termux TMPDIR."""
+    """Atomically edit one existing UTF-8 file; this tool cannot create files.
+
+    edits is a native array of {mode, match_text, write_text}. Canonical modes are
+    replace_match, insert_before, and insert_after. Each non-empty match_text/anchor
+    must occur uniquely. write_text is literal; insert modes never add a newline, so
+    include it explicitly. Compatibility input accepts matchText/writeText and mode
+    aliases insert_before_match/insert_after_match; output stays canonical snake_case.
+    Use read_file(line_numbers=false), capture sha256, dry_run with expected_sha256,
+    then apply the same payload/hash. Re-read after a stale error. Relative paths
+    resolve from HOME; /tmp maps to Termux TMPDIR. Use write_file to create/replace.
+    """
     transaction = _run_transaction([{
         "path": path,
         "edits": edits,
@@ -1077,8 +1258,19 @@ def edit_file(path: str, edits: list, dry_run: bool = False,
 
 
 @_serialized_threaded_tool
-def edit_files(files: list, dry_run: bool = False) -> dict:
-    """Atomically edit UTF-8 files; /tmp maps to Termux TMPDIR."""
+def edit_files(files: list[EditFileSpec], dry_run: bool = False) -> dict:
+    """Atomically edit multiple existing UTF-8 files; this cannot create files.
+
+    Each item is {path: str, edits: EditSpec[], expected_sha256: str|null}. EditSpec
+    uses canonical {mode, match_text, write_text}; modes are replace_match,
+    insert_before, insert_after. Matches must be unique and insert text is literal,
+    with no automatic newline. matchText/writeText and insert_before_match/
+    insert_after_match are accepted compatibility aliases; output is canonical.
+    All files validate before publication; dry_run previews diffs. Recommended flow:
+    read_file(line_numbers=false) -> sha256 -> dry_run -> apply the same payload/hash;
+    re-read if stale. Relative paths resolve from HOME; /tmp maps to Termux TMPDIR.
+    Use write_file to create or replace files.
+    """
     if not isinstance(files, list) or not files:
         return _tx_error("files must be a non-empty array")
     return _run_transaction(files, dry_run)
@@ -1090,5 +1282,7 @@ if __name__ == "__main__":
     if auth_token:
         app.add_middleware(AuthMiddleware, token=auth_token)
         print(f"[auth] token auth enabled ({auth_token[:4]}...{auth_token[-4:]})")
+    if HOST not in ("127.0.0.1", "::1", "localhost") and not auth_token:
+        print("[security] WARNING: non-loopback MCP_HOST without MCP_AUTH_TOKEN")
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT)

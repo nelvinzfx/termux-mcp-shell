@@ -1,6 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/sh
 set -eu
 PIDFILE="$HOME/.mcpsh.pid"
+HOST="${MCP_HOST:-127.0.0.1}"
 PORT="${MCP_PORT:-8088}"
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -21,20 +22,36 @@ if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "mcpsh started (PID $PID)"
     echo "  log: ~/.mcpsh.log"
     echo ""
-    echo "  MCP endpoints:"
-    echo "    local: http://127.0.0.1:$PORT/mcp"
-    # Detect LAN IP
-    LAN_IP=""
-    if command -v ifconfig >/dev/null 2>&1; then
-        LAN_IP=$(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1)
-    elif command -v ip >/dev/null 2>&1; then
-        LAN_IP=$(ip addr 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
-    fi
-    if [ -n "$LAN_IP" ]; then
-        echo "    LAN:   http://$LAN_IP:$PORT/mcp"
-    else
-        echo "    LAN:   (could not auto-detect, run: ifconfig)"
-    fi
+    case "$HOST" in
+        127.0.0.1|localhost)
+            echo "  MCP endpoint: http://$HOST:$PORT/mcp"
+            echo "  LAN access disabled (safe default)."
+            echo "  Set MCP_HOST=0.0.0.0 to enable LAN access."
+            ;;
+        ::1)
+            echo "  MCP endpoint: http://[::1]:$PORT/mcp"
+            echo "  LAN access disabled (safe default)."
+            echo "  Set MCP_HOST=0.0.0.0 to enable LAN access."
+            ;;
+        *)
+            echo "  MCP bind: $HOST:$PORT"
+            if [ -z "${MCP_AUTH_TOKEN:-}" ]; then
+                echo "  WARNING: non-loopback MCP_HOST without MCP_AUTH_TOKEN."
+                echo "  Set MCP_AUTH_TOKEN before exposing this shell server."
+            else
+                echo "  token authentication enabled"
+            fi
+            LAN_IP=""
+            if command -v ifconfig >/dev/null 2>&1; then
+                LAN_IP=$(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1)
+            elif command -v ip >/dev/null 2>&1; then
+                LAN_IP=$(ip addr 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+            fi
+            if [ -n "$LAN_IP" ]; then
+                echo "  LAN endpoint: http://$LAN_IP:$PORT/mcp"
+            fi
+            ;;
+    esac
 else
     echo "mcpsh failed to start, check ~/.mcpsh.log"
     rm -f "$PIDFILE"

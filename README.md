@@ -53,19 +53,21 @@ mcpsh-stop
 ```
 
 `mcpsh` writes the PID to `~/.mcpsh.pid`, logs to `~/.mcpsh.log`, and prints the
-local and detected LAN endpoints. The default MCP endpoint is:
+active endpoint and exposure status. The default MCP endpoint is:
 
 ```text
 http://127.0.0.1:8088/mcp
 ```
 
-The server binds `0.0.0.0:8088` by default.
+The server binds loopback-only `127.0.0.1:8088` by default. LAN access requires
+explicit `MCP_HOST=0.0.0.0`; set `MCP_AUTH_TOKEN` whenever using a non-loopback
+bind address.
 
 ## Configuration
 
 | Environment variable | Default | Purpose |
 |---|---:|---|
-| `MCP_HOST` | `0.0.0.0` | Bind address |
+| `MCP_HOST` | `127.0.0.1` | Bind address; set `0.0.0.0` explicitly for LAN |
 | `MCP_PORT` | `8088` | HTTP port |
 | `MCP_TRUNC_LIMIT` | `8192` | Initial command-output bytes returned |
 | `MCP_MAX_SESSIONS` | `50` | In-memory command-output buffers |
@@ -78,39 +80,48 @@ The server binds `0.0.0.0:8088` by default.
 ### Shell and output
 
 `run_command(command, timeout?, cwd?)` runs `/bin/sh -c` asynchronously. Timeout
-or cancellation kills the command's complete process group. Large stdout/stderr
-responses include a `session_id` and continuation offsets for
+or cancellation kills the command's complete process group. Omitted `cwd` defaults
+to `$HOME`; relative `cwd` values resolve from `$HOME`. Large stdout/stderr responses
+include a `session_id` and continuation offsets for
 `read_output(session_id, stream, offset, length)`.
 
 ### Reading files
 
 `read_file(path, offset=1, limit=null, line_numbers=true)` returns paginated
-UTF-8 text plus the exact file SHA-256. Set `line_numbers=false` when copying
-source into an exact edit. `read_files(reads)` batches up to 20 such ranges.
+UTF-8 text plus the exact file SHA-256. Line-number prefixes are display-only and
+must not be copied into `match_text`; set `line_numbers=false` when copying exact
+source. `read_files(reads)` batches up to 20 objects shaped as `{path, offset,
+limit, line_numbers}` with the same semantics.
 `read_file_bytes(path, offset=0, length=4096)` returns Base64 for binary or
 minified data.
 
 Filesystem work runs in worker threads, so slow storage does not block unrelated
 MCP requests.
 
-Android does not provide `/tmp`. File-tool paths under `/tmp` and a
-`run_command` `cwd` under `/tmp` are mapped to Termux's writable `$TMPDIR`.
+Relative file-tool paths resolve from `$HOME`, independent of server launch cwd,
+and `~` and absolute paths remain supported. Android does not provide `/tmp`.
+File-tool paths under `/tmp` and a `run_command` `cwd` under `/tmp` are mapped to
+Termux's writable `$TMPDIR`.
 Responses return the actual mapped path so later shell commands can reuse it.
 Literal `/tmp/...` text inside `run_command.command` is deliberately not
 rewritten; use the returned path or `$TMPDIR/...` there.
 
 ### Writing files
 
-`write_file(path, content)` atomically replaces one UTF-8 file.
-`append_file(path, content, expected_sha256=null)` atomically appends and can
-reject a stale current file. Both create parent directories and return the
-resulting SHA-256.
+`write_file(path, content, expected_sha256=null, create_only=false)` atomically
+creates or replaces one UTF-8 file and its parent directories. `expected_sha256`
+requires an existing file with that exact current hash; `create_only=true` requires
+a missing target. The two guards cannot be combined. `append_file(path, content,
+expected_sha256=null)` atomically appends and can reject a stale current file. All
+writes return the resulting SHA-256.
 
 ### Editing files
 
-`edit_file(path, edits, dry_run=false, expected_sha256=null)` edits one file.
-`edit_files(files, dry_run=false)` applies the same operation atomically across
-multiple files. Inputs are native arrays. Each edit has one explicit shape:
+`edit_file(path, edits, dry_run=false, expected_sha256=null)` edits one existing
+UTF-8 file. `edit_files(files, dry_run=false)` applies the same operation atomically
+across multiple existing UTF-8 files; each file item is `{path, edits,
+expected_sha256?}`. These tools never create files; use `write_file` to create or
+replace one. Inputs are native arrays. Each edit has one canonical shape:
 
 ```json
 {
@@ -151,6 +162,11 @@ Example transaction:
 }
 ```
 
+Compatibility input also accepts `matchText`/`writeText` and mode aliases
+`insert_before_match`/`insert_after_match`. Schemas, documentation examples, and
+results remain canonical snake_case. `old_text`/`new_text` and camel-case variants
+remain unsupported. Insertions are literal and never add a newline automatically.
+
 Every match must resolve uniquely. Matching supports normalized Unicode,
 trailing-whitespace tolerance, and indentation-insensitive blocks. Fuzzy matching
 only locates the original source span; unmatched text is never normalized or
@@ -158,17 +174,21 @@ rewritten. Overlapping edits and multiple operations at the same source position
 are rejected before writing. The server validates every file before writing
 anything, preserves UTF-8 BOM, line endings, and permission modes, always returns
 diffs, and attempts rollback if publishing one file fails. `dry_run` previews
-without writes; apply the same payload later with `expected_sha256` values to
-reject stale sources.
+without writes. The recommended guarded flow is `read_file(line_numbers=false)`
+then use its SHA-256 for `dry_run`, then apply the same payload and hash. Re-read and
+rebuild the payload after any stale-source error.
 
 ## Authentication
 
-By default the server has no authentication. Anyone who can reach it can execute
-commands and read or modify files. Restrict it to a trusted network or set:
+The unauthenticated default is reachable only over loopback. Anyone who can reach
+a non-loopback bind can execute commands and read or modify files. LAN exposure is
+explicit and should always use a strong token:
 
 ```sh
-MCP_AUTH_TOKEN="$(openssl rand -hex 32)" mcpsh
+MCP_HOST=0.0.0.0 MCP_AUTH_TOKEN="<strong-random-token>" mcpsh
 ```
+
+The server does not generate or persist secrets.
 
 Clients may send either:
 

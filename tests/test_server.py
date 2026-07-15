@@ -799,7 +799,8 @@ def test_tmp_alias_rejects_escape(tmp_path, monkeypatch):
 
 def test_public_tool_signatures_are_minimal():
     import inspect
-    assert list(inspect.signature(server.write_file).parameters) == ["path", "content"]
+    assert list(inspect.signature(server.write_file).parameters) == [
+        "path", "content", "expected_sha256", "create_only"]
     assert list(inspect.signature(server.append_file).parameters) == [
         "path", "content", "expected_sha256"]
     assert list(inspect.signature(server.edit_file).parameters) == [
@@ -835,3 +836,234 @@ def test_edit_files_rejects_binary(tmp_path):
     ])
     assert not result["ok"]
     assert "utf-8" in result["error"].lower() or "unicode" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Contract schemas, compatibility aliases, paths, write guards, safe defaults
+# ---------------------------------------------------------------------------
+
+def _schema_ref(schema, node):
+    ref = node.get("$ref")
+    return schema["$defs"][ref.rsplit("/", 1)[-1]] if ref else node
+
+
+def test_generated_mcp_schemas_expose_nested_contracts():
+    edit_schema = server.mcp._tool_manager._tools["edit_file"].parameters
+    edit_item = _schema_ref(edit_schema, edit_schema["properties"]["edits"]["items"])
+    assert set(edit_item["required"]) == {"mode", "match_text", "write_text"}
+    assert edit_item["properties"]["mode"]["enum"] == [
+        "replace_match", "insert_before", "insert_after"]
+    assert edit_item["properties"]["match_text"]["minLength"] == 1
+    assert "matchText" in edit_item["properties"]["match_text"]["description"]
+    assert "writeText" in edit_item["properties"]["write_text"]["description"]
+    assert "insert_before_match" in edit_item["properties"]["mode"]["description"]
+
+    files_schema = server.mcp._tool_manager._tools["edit_files"].parameters
+    file_item = _schema_ref(files_schema, files_schema["properties"]["files"]["items"])
+    assert set(file_item["required"]) == {"path", "edits"}
+    nested_edit = _schema_ref(files_schema, file_item["properties"]["edits"]["items"])
+    assert nested_edit["properties"]["mode"]["enum"] == [
+        "replace_match", "insert_before", "insert_after"]
+
+    reads_schema = server.mcp._tool_manager._tools["read_files"].parameters
+    read_item = _schema_ref(reads_schema, reads_schema["properties"]["reads"]["items"])
+    assert read_item["required"] == ["path"]
+    assert set(read_item["properties"]) == {
+        "path", "offset", "limit", "line_numbers"}
+
+
+def test_mcp_alias_payloads_normalize_results(tmp_path):
+    path = tmp_path / "alias.txt"
+    path.write_text("alpha\nbeta\n")
+
+    async def scenario():
+        _, result = await server.mcp.call_tool("edit_file", {
+            "path": str(path),
+            "edits": [{
+                "mode": "insert_after_match",
+                "matchText": "alpha",
+                "writeText": "\ninserted",
+            }],
+        })
+        return result
+
+    result = asyncio.run(scenario())
+    assert result["ok"]
+    assert result["results"][0]["mode"] == "insert_after"
+    assert path.read_text() == "alpha\ninserted\nbeta\n"
+
+
+def test_edit_aliases_and_conflicts_direct_runtime(tmp_path):
+    path = tmp_path / "alias.txt"
+    path.write_text("alpha\n")
+    accepted = server.edit_file(str(path), [{
+        "mode": "insert_before_match", "matchText": "alpha", "writeText": "x\n"}])
+    assert accepted["ok"]
+    assert accepted["results"][0]["mode"] == "insert_before"
+
+    equal_duplicates = server.edit_file(str(path), [{
+        "mode": "replace_match", "match_text": "alpha", "matchText": "alpha",
+        "write_text": "alpha", "writeText": "alpha"}])
+    assert equal_duplicates["ok"]
+
+    conflict = server.edit_file(str(path), [{
+        "mode": "replace_match", "match_text": "alpha", "matchText": "other",
+        "write_text": "beta", "writeText": "beta"}])
+    assert not conflict["ok"]
+    assert "conflicting values for match_text and matchText" in conflict["error"]
+
+    unknown = server.edit_file(str(path), [{
+        "mode": "replace_match", "match_text": "alpha", "write_text": "beta",
+        "unexpected": True}])
+    assert not unknown["ok"]
+    assert "unsupported fields ['unexpected']" in unknown["error"]
+
+
+def test_edit_validation_errors_explain_recovery(tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("alpha\n")
+    payloads = [
+        [{"old_text": "alpha", "new_text": "beta"}],
+        [{"mode": "replace", "match_text": "alpha", "write_text": "beta"}],
+        [{"mode": "replace_match", "match_text": "alpha"}],
+    ]
+    for payload in payloads:
+        result = server.edit_file(str(path), payload)
+        assert not result["ok"]
+        assert "match_text (or matchText)" in result["error"]
+        assert "write_text (or writeText)" in result["error"]
+        assert "replace_match, insert_before, insert_after" in result["error"]
+        assert "insert_before_match, insert_after_match" in result["error"]
+    assert "unsupported" in server.edit_file(str(path), payloads[0])["error"]
+    assert "invalid mode" in server.edit_file(str(path), payloads[1])["error"]
+    assert path.read_text() == "alpha\n"
+
+
+def test_edit_files_content_entry_points_to_write_file(tmp_path):
+    path = tmp_path / "missing.txt"
+    result = server.edit_files([{"path": str(path), "content": "new"}])
+    assert not result["ok"]
+    assert "existing UTF-8 files" in result["error"]
+    assert "write_file" in result["error"]
+    assert not path.exists()
+
+
+def test_relative_file_paths_resolve_from_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    elsewhere = tmp_path / "elsewhere"
+    home.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.setattr(server, "HOME_ROOT", home)
+    monkeypatch.chdir(elsewhere)
+
+    written = server.write_file("project/file.txt", "alpha\n")
+    assert written["ok"]
+    assert written["path"] == str(home / "project" / "file.txt")
+    assert not (elsewhere / "project" / "file.txt").exists()
+    read = server.read_file("project/file.txt", line_numbers=False)
+    assert read["content"] == "alpha\n"
+
+
+def test_run_command_default_and_relative_cwd_use_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    child = home / "project"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(server, "HOME_ROOT", home)
+
+    default = asyncio.run(server.run_command("pwd; printf /tmp/literal"))
+    relative = asyncio.run(server.run_command("pwd", cwd="project"))
+    assert default["exit_code"] == 0
+    lines = default["stdout"].splitlines()
+    assert lines[0] == str(home)
+    assert lines[1] == "/tmp/literal"
+    assert relative["stdout"].strip() == str(child)
+
+
+def test_write_file_guards(tmp_path):
+    path = tmp_path / "guarded.txt"
+    created = server.write_file(str(path), "one", create_only=True)
+    assert created["ok"]
+    blocked_create = server.write_file(str(path), "two", create_only=True)
+    assert not blocked_create["ok"]
+    assert path.read_text() == "one"
+
+    stale = server.write_file(str(path), "two", expected_sha256="0" * 64)
+    assert not stale["ok"]
+    assert "stale" in stale["error"]
+    assert path.read_text() == "one"
+
+    source_sha = hashlib.sha256(b"one").hexdigest().upper()
+    replaced = server.write_file(str(path), "two", expected_sha256=source_sha)
+    assert replaced["ok"]
+    assert path.read_text() == "two"
+
+    missing = server.write_file(
+        str(tmp_path / "missing.txt"), "x", expected_sha256=source_sha)
+    assert not missing["ok"]
+    assert "does not exist" in missing["error"]
+    assert not (tmp_path / "missing.txt").exists()
+
+
+def test_write_file_create_only_rejects_dangling_symlink(tmp_path):
+    target = tmp_path / "missing-target.txt"
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    result = server.write_file(str(link), "replacement", create_only=True)
+    assert not result["ok"]
+    assert "already exists" in result["error"]
+    assert link.is_symlink()
+    assert not target.exists()
+
+
+def test_write_file_concurrent_expected_hash_serializes(tmp_path):
+    path = tmp_path / "race.txt"
+    path.write_text("base")
+    sha = hashlib.sha256(b"base").hexdigest()
+    barrier = threading.Barrier(2)
+    results = []
+
+    def writer(value):
+        barrier.wait()
+        results.append(server.write_file(
+            str(path), value, expected_sha256=sha))
+
+    threads = [threading.Thread(target=writer, args=(value,))
+               for value in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert sum(result["ok"] for result in results) == 1
+    assert sum("stale" in (result["error"] or "") for result in results) == 1
+
+
+def test_safe_host_default_and_launcher_guidance():
+    import subprocess
+    env = os.environ.copy()
+    env.pop("MCP_HOST", None)
+    result = subprocess.run(
+        ["python", "-c", "import server; print(server.HOST)"],
+        cwd=pathlib.Path(server.__file__).parent,
+        env=env, text=True, capture_output=True, check=True)
+    assert result.stdout.strip() == "127.0.0.1"
+    for path in ("bin/mcpsh", "install.sh"):
+        text = pathlib.Path(path).read_text()
+        assert '${MCP_HOST:-127.0.0.1}' in text
+        assert "non-loopback MCP_HOST without MCP_AUTH_TOKEN" in text
+
+
+def test_mcp_visible_descriptions_contain_recovery_guidance():
+    descriptions = {
+        name: server.mcp._tool_manager._tools[name].description
+        for name in ("write_file", "read_file", "read_files", "edit_file",
+                     "edit_files", "run_command")}
+    assert "cannot create" in descriptions["edit_file"]
+    assert "line_numbers=false" in descriptions["edit_file"]
+    assert "dry_run" in descriptions["edit_file"]
+    assert "never add a newline" in descriptions["edit_file"]
+    assert "Each item" in descriptions["edit_files"]
+    assert "display-only" in descriptions["read_file"]
+    assert "line_numbers" in descriptions["read_files"]
+    assert "create or replace" in descriptions["write_file"]
+    assert "$TMPDIR" in descriptions["run_command"]
+    assert "never rewritten" in descriptions["run_command"]
