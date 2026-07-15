@@ -656,6 +656,72 @@ def test_edit_apis_reject_legacy_payloads(tmp_path):
     assert path.read_text() == "alpha\n"
 
 
+def test_tmp_alias_works_across_file_tools(tmp_path, monkeypatch):
+    temp_root = tmp_path / "termux-tmp"
+    temp_root.mkdir()
+    monkeypatch.setattr(server, "TEMP_ROOT", temp_root)
+
+    written = server.write_file("/tmp/nested/file.txt", "alpha\n")
+    actual = temp_root / "nested" / "file.txt"
+    assert written["ok"] and written["path"] == str(actual)
+    assert actual.read_text() == "alpha\n"
+
+    read = server.read_file("/tmp/nested/file.txt", line_numbers=False)
+    assert read["path"] == str(actual)
+    assert read["content"] == "alpha\n"
+
+    appended = server.append_file(
+        "/tmp/nested/file.txt", "beta\n", expected_sha256=read["sha256"])
+    assert appended["ok"] and appended["path"] == str(actual)
+
+    edited = server.edit_file("/tmp/nested/file.txt", [{
+        "mode": "replace_match",
+        "match_text": "beta",
+        "write_text": "BETA",
+    }])
+    assert edited["ok"] and edited["path"] == str(actual)
+
+    binary = server.read_file_bytes("/tmp/nested/file.txt")
+    assert binary["ok"] and binary["path"] == str(actual)
+    assert base64.b64decode(binary["data_base64"]) == b"alpha\nBETA\n"
+
+
+def test_tmp_alias_works_for_multi_edit_and_command_cwd(tmp_path, monkeypatch):
+    temp_root = tmp_path / "termux-tmp"
+    work = temp_root / "work"
+    work.mkdir(parents=True)
+    (work / "a.txt").write_text("alpha\n")
+    monkeypatch.setattr(server, "TEMP_ROOT", temp_root)
+
+    edited = server.edit_files([{
+        "path": "/tmp/work/a.txt",
+        "edits": [{
+            "mode": "replace_match",
+            "match_text": "alpha",
+            "write_text": "beta",
+        }],
+    }])
+    assert edited["ok"]
+    assert edited["files"][0]["path"] == str(work / "a.txt")
+
+    command = asyncio.run(server.run_command(
+        "pwd; printf done > relative.txt", cwd="/tmp/work"))
+    assert command["exit_code"] == 0
+    assert command["stdout"].strip() == str(work)
+    assert (work / "relative.txt").read_text() == "done"
+
+
+def test_tmp_alias_rejects_escape(tmp_path, monkeypatch):
+    temp_root = tmp_path / "termux-tmp"
+    temp_root.mkdir()
+    monkeypatch.setattr(server, "TEMP_ROOT", temp_root)
+
+    result = server.write_file("/tmp/../escape.txt", "nope")
+    assert not result["ok"]
+    assert "escapes" in result["error"]
+    assert not (tmp_path / "escape.txt").exists()
+
+
 def test_public_tool_signatures_are_minimal():
     import inspect
     assert list(inspect.signature(server.write_file).parameters) == ["path", "content"]

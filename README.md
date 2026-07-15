@@ -89,6 +89,12 @@ minified data.
 Filesystem work runs in worker threads, so slow storage does not block unrelated
 MCP requests.
 
+Android does not provide `/tmp`. File-tool paths under `/tmp` and a
+`run_command` `cwd` under `/tmp` are mapped to Termux's writable `$TMPDIR`.
+Responses return the actual mapped path so later shell commands can reuse it.
+Literal `/tmp/...` text inside `run_command.command` is deliberately not
+rewritten; use the returned path or `$TMPDIR/...` there.
+
 ### Writing files
 
 `write_file(path, content)` atomically replaces one UTF-8 file.

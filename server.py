@@ -27,6 +27,7 @@ HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MCP_PORT", "8088"))
 TRUNC_LIMIT = int(os.environ.get("MCP_TRUNC_LIMIT", "8192"))
 MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "50"))
+TEMP_ROOT = pathlib.Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
 
 
 # session_id -> {"stdout": bytes, "stderr": bytes}
@@ -36,6 +37,19 @@ _buffers: "OrderedDict[str, dict]" = OrderedDict()
 _TRANSACTION_LOCK = threading.RLock()
 
 mcp = FastMCP("termux-shell", host=HOST, port=PORT)
+
+
+def _tool_path(path: str) -> pathlib.Path:
+    """Map Android's missing /tmp namespace to Termux's writable TMPDIR."""
+    expanded = pathlib.Path(path).expanduser()
+    if path != "/tmp" and not path.startswith("/tmp/"):
+        return expanded
+    root = TEMP_ROOT.resolve(strict=False)
+    relative = pathlib.PurePosixPath(path).relative_to("/tmp")
+    mapped = root.joinpath(*relative.parts).resolve(strict=False)
+    if mapped != root and root not in mapped.parents:
+        raise ValueError("/tmp path escapes the temporary directory")
+    return mapped
 
 
 def _threaded_tool(fn):
@@ -149,13 +163,22 @@ async def run_command(command: str, timeout: float | None = None,
     """Run a shell command via /bin/sh -c and return stdout/stderr/exit_code.
 
     Long output is truncated to MCP_TRUNC_LIMIT bytes; full output is kept in a
-    buffer readable via read_output using the returned session_id.
+    buffer readable via read_output using the returned session_id. A cwd under
+    /tmp is mapped to Termux's TMPDIR; command text is not rewritten.
     """
-    spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
-        command, cwd=cwd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        executable="/bin/sh", start_new_session=True,
-    ))
+    try:
+        resolved_cwd = str(_tool_path(cwd)) if cwd is not None else None
+        spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
+            command, cwd=resolved_cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            executable="/bin/sh", start_new_session=True,
+        ))
+    except Exception as error:
+        return {"error": f"spawn failed: {error}", "exit_code": None, "timed_out": False,
+                "stdout": "", "stderr": "", "stdout_truncated": False,
+                "stderr_truncated": False, "stdout_total_bytes": 0,
+                "stderr_total_bytes": 0, "session_id": None,
+                "stdout_next_offset": None, "stderr_next_offset": None}
     try:
         proc = await asyncio.shield(spawn_task)
     except asyncio.CancelledError as cancelled:
@@ -550,9 +573,9 @@ def _atomic_write(p: pathlib.Path, data: bytes) -> None:
 
 @_serialized_threaded_tool
 def write_file(path: str, content: str) -> WriteResult:
-    """Atomically write UTF-8 content, creating parent directories."""
+    """Atomically write UTF-8 content, creating parents; /tmp maps to Termux TMPDIR."""
     try:
-        p = pathlib.Path(path).expanduser()
+        p = _tool_path(path)
         data = content.encode("utf-8")
         _atomic_write(p, data)
         return {
@@ -570,9 +593,9 @@ def write_file(path: str, content: str) -> WriteResult:
 @_serialized_threaded_tool
 def append_file(path: str, content: str,
                 expected_sha256: str | None = None) -> WriteResult:
-    """Atomically append UTF-8 content with optional stale-source protection."""
+    """Atomically append UTF-8 content; /tmp maps to Termux TMPDIR."""
     try:
-        p = pathlib.Path(path).expanduser()
+        p = _tool_path(path)
         current = p.read_bytes() if p.exists() else b""
         current_sha = hashlib.sha256(current).hexdigest()
         if expected_sha256 is not None and not hmac.compare_digest(
@@ -615,6 +638,7 @@ class EditResult(TypedDict):
 
 
 class ReadResult2(TypedDict):
+    path: str
     content: str
     start_line: int
     end_line: int
@@ -627,11 +651,11 @@ class ReadResult2(TypedDict):
 
 @_threaded_tool
 def read_file_bytes(path: str, offset: int = 0, length: int = 4096) -> dict:
-    """Read a byte range, returning base64 data so binary and minified files are safe."""
+    """Read bytes as base64; /tmp maps to Termux TMPDIR."""
     if offset < 0 or length < 0:
         return {"ok": False, "path": path, "offset": offset, "length": 0, "total_bytes": 0, "eof": True, "data_base64": "", "error": "offset and length must be non-negative"}
     try:
-        p = pathlib.Path(path).expanduser(); total = p.stat().st_size
+        p = _tool_path(path); total = p.stat().st_size
         with p.open("rb") as f: f.seek(offset); data = f.read(length)
         return {"ok": True, "path": str(p), "offset": offset, "length": len(data), "total_bytes": total, "eof": offset + len(data) >= total, "data_base64": base64.b64encode(data).decode("ascii"), "error": None}
     except Exception as e:
@@ -641,13 +665,15 @@ def read_file_bytes(path: str, offset: int = 0, length: int = 4096) -> dict:
 def _read_file(path: str, offset: int = 1, limit: int | None = None,
                line_numbers: bool = True) -> ReadResult2:
     try:
-        p = pathlib.Path(path).expanduser()
+        p = _tool_path(path)
         raw_bytes = p.read_bytes()
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
         text = raw_bytes.decode("utf-8", errors="replace")
     except Exception as e:
-        return {"content": "", "start_line": offset, "end_line": 0, "total_lines": 0,
-                "truncated": False, "next_offset": None, "sha256": None, "error": str(e)}
+        reported_path = str(p) if "p" in locals() else path
+        return {"path": reported_path, "content": "", "start_line": offset,
+                "end_line": 0, "total_lines": 0, "truncated": False,
+                "next_offset": None, "sha256": None, "error": str(e)}
     lines = text.split("\n")
     final_newline = bool(lines and lines[-1] == "")
     if final_newline:
@@ -655,8 +681,9 @@ def _read_file(path: str, offset: int = 1, limit: int | None = None,
     total = len(lines)
     start = max(0, offset - 1)
     if start >= total:
-        return {"content": "", "start_line": offset, "end_line": 0, "total_lines": total,
-                "truncated": False, "next_offset": None, "sha256": sha256,
+        return {"path": str(p), "content": "", "start_line": offset,
+                "end_line": 0, "total_lines": total, "truncated": False,
+                "next_offset": None, "sha256": sha256,
                 "error": f"offset {offset} is beyond end of file ({total} lines total)"}
     end = min(start + limit, total) if limit is not None else total
     end = min(end, start + READ_MAX_LINES)
@@ -681,15 +708,15 @@ def _read_file(path: str, offset: int = 1, limit: int | None = None,
         remaining = total - (start + n)
         body += (f"\n\n--- TRUNCATED: showing lines {start + 1}-{start + n} of {total} "
                  f"({remaining} more). Use offset={next_off} to continue. ---")
-    return {"content": body, "start_line": start + 1, "end_line": start + n,
-            "total_lines": total, "truncated": truncated, "next_offset": next_off,
-            "sha256": sha256, "error": None}
+    return {"path": str(p), "content": body, "start_line": start + 1,
+            "end_line": start + n, "total_lines": total, "truncated": truncated,
+            "next_offset": next_off, "sha256": sha256, "error": None}
 
 
 @_threaded_tool
 def read_file(path: str, offset: int = 1, limit: int | None = None,
               line_numbers: bool = True) -> ReadResult2:
-    """Read paginated UTF-8 text; set line_numbers=false for exact raw text.
+    """Read paginated UTF-8 text; /tmp maps to Termux TMPDIR.
 
     Returns sha256 of the exact file bytes. offset is 1-indexed and limit caps
     lines before the server's line/byte limits. Use next_offset to continue.
@@ -747,7 +774,7 @@ def _canonicalize_paths(file_specs: list[dict]) -> list[tuple[pathlib.Path, dict
     seen: dict[str, str] = {}
     result = []
     for spec in file_specs:
-        p = pathlib.Path(spec["path"]).expanduser()
+        p = _tool_path(spec["path"])
         real = p.resolve(strict=False)
         key = str(real)
         if key in seen:
@@ -913,15 +940,16 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
             return _tx_error(f"invalid edit in {spec['path']}: {error}")
 
         new_bytes = (bom + _restore_ending(new, ending)).encode("utf-8")
+        reported_path = str(_tool_path(spec["path"]))
         file_data.append({
-            "path": spec["path"],
+            "path": reported_path,
             "canonical": canon,
             "raw_bytes": raw,
             "sha256": source_sha,
             "old_mode": old_mode,
             "new_bytes": new_bytes,
             "new_sha256": hashlib.sha256(new_bytes).hexdigest(),
-            "diff": _make_diff(base, new, spec["path"]),
+            "diff": _make_diff(base, new, reported_path),
             "results": results,
             "batch_error": batch_error,
             "changed": base != new,
@@ -950,7 +978,7 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
 @_serialized_threaded_tool
 def edit_file(path: str, edits: list, dry_run: bool = False,
               expected_sha256: str | None = None) -> EditResult:
-    """Atomically edit one UTF-8 file using explicit edit modes."""
+    """Atomically edit one UTF-8 file; /tmp maps to Termux TMPDIR."""
     transaction = _run_transaction([{
         "path": path,
         "edits": edits,
@@ -983,7 +1011,7 @@ def edit_file(path: str, edits: list, dry_run: bool = False,
 
 @_serialized_threaded_tool
 def edit_files(files: list, dry_run: bool = False) -> dict:
-    """Atomically validate and edit one or more UTF-8 files."""
+    """Atomically edit UTF-8 files; /tmp maps to Termux TMPDIR."""
     if not isinstance(files, list) or not files:
         return _tx_error("files must be a non-empty array")
     return _run_transaction(files, dry_run)
