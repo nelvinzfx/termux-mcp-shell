@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import hashlib
-import json
 import os
 import pathlib
 import shlex
@@ -18,7 +17,7 @@ import server
 def test_edit_noop_is_success(tmp_path):
     path = tmp_path / "file.txt"
     path.write_text("same\n")
-    result = server.edit_file(str(path), json.dumps([{"old_text": "same", "new_text": "same"}]))
+    result = server.edit_file(str(path), [{"mode": "replace_match", "match_text": "same", "write_text": "same"}])
     assert result["ok"] is True
     assert result["changed"] is False
     assert result["replacements"] == 0
@@ -30,8 +29,8 @@ def test_atomic_failure_has_per_edit_diagnostics_and_does_not_write(tmp_path):
     path = tmp_path / "file.txt"
     path.write_text("one\ntwo\n")
     result = server.edit_file(str(path), [
-        {"old_text": "one", "new_text": "ONE"},
-        {"old_text": "missing", "new_text": "MISSING"},
+        {"mode": "replace_match", "match_text": "one", "write_text": "ONE"},
+        {"mode": "replace_match", "match_text": "missing", "write_text": "MISSING"},
     ])
     assert result["ok"] is False
     assert result["batch_aborted"] is True
@@ -44,14 +43,6 @@ def test_atomic_failure_has_per_edit_diagnostics_and_does_not_write(tmp_path):
     assert path.read_text() == "one\ntwo\n"
 
 
-def test_edit_accepts_legacy_json_string_and_native_array(tmp_path):
-    path = tmp_path / "file.txt"
-    path.write_text("a")
-    assert server.edit_file(str(path), '[{"old_text":"a","new_text":"b"}]')["ok"]
-    assert server.edit_file(str(path), [{"old_text": "b", "new_text": "c"}])["ok"]
-    assert path.read_text() == "c"
-
-
 def test_append_is_atomic_creates_parent_and_reports_metadata(tmp_path):
     path = tmp_path / "nested" / "file.txt"
     result = server.append_file(str(path), "hello")
@@ -59,9 +50,13 @@ def test_append_is_atomic_creates_parent_and_reports_metadata(tmp_path):
     assert result["bytes_written"] == 5
     assert result["sha256"] == hashlib.sha256(b"hello").hexdigest()
     assert path.read_text() == "hello"
-    failed = server.append_file(str(path), "!", "0" * 64)
+    current_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    guarded = server.append_file(str(path), "!", expected_sha256=current_sha)
+    assert guarded["ok"] is True
+    assert path.read_text() == "hello!"
+    failed = server.append_file(str(path), "?", expected_sha256="0" * 64)
     assert failed["ok"] is False
-    assert path.read_text() == "hello"
+    assert path.read_text() == "hello!"
 
 
 def test_read_file_bytes_paginates_binary(tmp_path):
@@ -78,8 +73,7 @@ def test_read_file_bytes_paginates_binary(tmp_path):
 def test_write_file_sha256_and_atomic_payload(tmp_path):
     path = tmp_path / "large.txt"
     payload = "x" * 10000
-    digest = hashlib.sha256(payload.encode()).hexdigest()
-    result = server.write_file(str(path), payload, digest)
+    result = server.write_file(str(path), payload)
     assert result["ok"] is True
     assert result["bytes_written"] == len(payload.encode())
     assert path.read_text() == payload
@@ -247,7 +241,7 @@ def test_edit_file_expected_sha256_success(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("alpha\n")
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = server.edit_file(str(path), [{"old_text": "alpha", "new_text": "beta"}],
+    result = server.edit_file(str(path), [{"mode": "replace_match", "match_text": "alpha", "write_text": "beta"}],
                               expected_sha256=sha)
     assert result["ok"] is True
     assert path.read_text() == "beta\n"
@@ -256,7 +250,7 @@ def test_edit_file_expected_sha256_success(tmp_path):
 def test_edit_file_expected_sha256_stale(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("alpha\n")
-    result = server.edit_file(str(path), [{"old_text": "alpha", "new_text": "beta"}],
+    result = server.edit_file(str(path), [{"mode": "replace_match", "match_text": "alpha", "write_text": "beta"}],
                               expected_sha256="0" * 64)
     assert result["ok"] is False
     assert "stale" in result["error"].lower()
@@ -282,7 +276,7 @@ def test_insert_before_mode(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("a\nb\nc\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_before", "anchor": "b", "content": "INSERTED"}
+        {"mode": "insert_before", "match_text": "b", "write_text": "INSERTED"}
     ])
     assert result["ok"]
     assert path.read_text() == "a\nINSERTEDb\nc\n"
@@ -292,7 +286,7 @@ def test_insert_after_mode(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("a\nb\nc\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_after", "anchor": "b", "content": "INSERTED"}
+        {"mode": "insert_after", "match_text": "b", "write_text": "INSERTED"}
     ])
     assert result["ok"]
     assert path.read_text() == "a\nbINSERTED\nc\n"
@@ -303,7 +297,7 @@ def test_insert_before_with_newline_content(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("a\nb\nc\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_before", "anchor": "b", "content": "X\nY\n"}
+        {"mode": "insert_before", "match_text": "b", "write_text": "X\nY\n"}
     ])
     assert result["ok"]
     assert path.read_text() == "a\nX\nY\nb\nc\n"
@@ -313,22 +307,12 @@ def test_insert_after_with_newline_content(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("a\nb\nc\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_after", "anchor": "b", "content": "\nX\nY"}
+        {"mode": "insert_after", "match_text": "b", "write_text": "\nX\nY"}
     ])
     assert result["ok"]
     assert path.read_text() == "a\nb\nX\nY\nc\n"
 
 
-def test_legacy_mode_still_works_alongside_explicit(tmp_path):
-    path = tmp_path / "f.txt"
-    path.write_text("one\ntwo\nthree\n")
-    result = server.edit_file(str(path), [
-        {"old_text": "one", "new_text": "ONE"},
-        {"mode": "insert_after", "anchor": "two", "content": "2.5"},
-        {"mode": "replace_match", "match_text": "three", "write_text": "THREE"},
-    ])
-    assert result["ok"]
-    assert path.read_text() == "ONE\ntwo2.5\nTHREE\n"
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +323,7 @@ def test_ambiguous_anchor_rejected(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("dup\ndup\nother\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_before", "anchor": "dup", "content": "X"}
+        {"mode": "insert_before", "match_text": "dup", "write_text": "X"}
     ])
     assert not result["ok"]
     assert result["batch_aborted"]
@@ -352,7 +336,7 @@ def test_missing_anchor_has_closest_match(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("hello world\nfoo bar\nbaz qux\n")
     result = server.edit_file(str(path), [
-        {"mode": "insert_before", "anchor": "hello wrld", "content": "X"}
+        {"mode": "insert_before", "match_text": "hello wrld", "write_text": "X"}
     ])
     assert not result["ok"]
     r = result["results"][0]
@@ -363,11 +347,11 @@ def test_missing_anchor_has_closest_match(tmp_path):
     assert r["closest_match_line"] == 1
 
 
-def test_missing_old_text_has_closest_match(tmp_path):
+def test_missing_match_text_has_closest_match(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("def foo():\n    return 42\n")
     result = server.edit_file(str(path), [
-        {"old_text": "def foo:", "new_text": "X"}
+        {"mode": "replace_match", "match_text": "def foo:", "write_text": "X"}
     ])
     assert not result["ok"]
     r = result["results"][0]
@@ -380,7 +364,7 @@ def test_diagnostics_are_bounded(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("\n".join(f"line {i}" for i in range(1000)) + "\n")
     result = server.edit_file(str(path), [
-        {"old_text": "nonexistent text here", "new_text": "X"}
+        {"mode": "replace_match", "match_text": "nonexistent text here", "write_text": "X"}
     ])
     assert not result["ok"]
     r = result["results"][0]
@@ -398,8 +382,8 @@ def test_two_file_atomic_success(tmp_path):
     p1.write_text("alpha\n")
     p2.write_text("beta\n")
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "beta", "new_text": "BETA"}]},
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "ALPHA"}]},
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "beta", "write_text": "BETA"}]},
     ])
     assert result["ok"]
     assert result["applied"]
@@ -410,7 +394,7 @@ def test_two_file_atomic_success(tmp_path):
         assert f["ok"]
         assert f["sha256"]
         assert f["result_sha256"]
-        assert f["diff"]  # return_diff defaults to True
+        assert f["diff"]
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +409,8 @@ def test_failed_second_file_leaves_both_unchanged(tmp_path):
     orig1 = p1.read_bytes()
     orig2 = p2.read_bytes()
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "nonexistent", "new_text": "X"}]},
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "ALPHA"}]},
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "nonexistent", "write_text": "X"}]},
     ])
     assert not result["ok"]
     assert not result["applied"]
@@ -443,7 +427,7 @@ def test_stale_hash_single_file(tmp_path):
     p.write_text("alpha\n")
     result = server.edit_files([
         {"path": str(p),
-         "edits": [{"old_text": "alpha", "new_text": "BETA"}],
+         "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "BETA"}],
          "expected_sha256": "0" * 64},
     ])
     assert not result["ok"]
@@ -458,9 +442,9 @@ def test_stale_hash_multi_file(tmp_path):
     p2.write_text("beta\n")
     sha1 = hashlib.sha256(p1.read_bytes()).hexdigest()
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "X"}],
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "X"}],
          "expected_sha256": sha1},
-        {"path": str(p2), "edits": [{"old_text": "beta", "new_text": "Y"}],
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "beta", "write_text": "Y"}],
          "expected_sha256": "0" * 64},
     ])
     assert not result["ok"]
@@ -477,8 +461,8 @@ def test_duplicate_path_rejected(tmp_path):
     p = tmp_path / "a.txt"
     p.write_text("alpha\n")
     result = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "X"}]},
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "Y"}]},
+        {"path": str(p), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "X"}]},
+        {"path": str(p), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "Y"}]},
     ])
     assert not result["ok"]
     assert "duplicate" in result["error"].lower()
@@ -493,15 +477,15 @@ def test_symlink_alias_rejected(tmp_path):
     except OSError:
         return  # symlinks not supported on this platform
     result = server.edit_files([
-        {"path": str(target), "edits": [{"old_text": "data", "new_text": "X"}]},
-        {"path": str(link), "edits": [{"old_text": "data", "new_text": "Y"}]},
+        {"path": str(target), "edits": [{"mode": "replace_match", "match_text": "data", "write_text": "X"}]},
+        {"path": str(link), "edits": [{"mode": "replace_match", "match_text": "data", "write_text": "Y"}]},
     ])
     assert not result["ok"]
     assert "duplicate" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------
-# Dry-run no-write, per-file diff, validate_all
+# Dry-run no-write and per-file diff
 # ---------------------------------------------------------------------------
 
 def test_dry_run_no_write(tmp_path):
@@ -512,8 +496,8 @@ def test_dry_run_no_write(tmp_path):
     orig1 = p1.read_bytes()
     orig2 = p2.read_bytes()
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "beta", "new_text": "BETA"}]},
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "ALPHA"}]},
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "beta", "write_text": "BETA"}]},
     ], dry_run=True)
     assert result["ok"]
     assert result["dry_run"]
@@ -528,9 +512,9 @@ def test_dry_run_per_file_diff(tmp_path):
     p1.write_text("alpha\n")
     p2.write_text("beta\n")
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "beta", "new_text": "BETA"}]},
-    ], dry_run=True, return_diff=True)
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "ALPHA"}]},
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "beta", "write_text": "BETA"}]},
+    ], dry_run=True)
     assert result["ok"]
     diffs = [f["diff"] for f in result["files"]]
     assert all(d for d in diffs)
@@ -542,7 +526,7 @@ def test_dry_run_source_and_result_sha256(tmp_path):
     p = tmp_path / "a.txt"
     p.write_text("alpha\n")
     result = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
+        {"path": str(p), "edits": [{"mode": "replace_match", "match_text": "alpha", "write_text": "beta"}]},
     ], dry_run=True)
     assert result["ok"]
     f = result["files"][0]
@@ -550,166 +534,6 @@ def test_dry_run_source_and_result_sha256(tmp_path):
     assert f["result_sha256"] == hashlib.sha256(b"beta\n").hexdigest()
 
 
-def test_validate_all_false_applies_successful_files(tmp_path):
-    p1 = tmp_path / "a.txt"
-    p2 = tmp_path / "b.txt"
-    p1.write_text("alpha\n")
-    p2.write_text("beta\n")
-    result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "nonexistent", "new_text": "X"}]},
-    ], validate_all=False)
-    assert result["ok"]  # no top-level error
-    assert result["applied"]
-    assert p1.read_text() == "ALPHA\n"
-    assert p2.read_text() == "beta\n"  # unchanged
-    files = {f["path"]: f for f in result["files"]}
-    assert files[str(p1)]["ok"]
-    assert not files[str(p2)]["ok"]
-
-
-# ---------------------------------------------------------------------------
-# Plan create / apply by id only
-# ---------------------------------------------------------------------------
-
-def test_plan_create_and_apply(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    # Create plan
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    assert dry["ok"]
-    assert dry["plan_id"]
-    plan_id = dry["plan_id"]
-    assert p.read_text() == "alpha\n"  # not written
-
-    # Apply plan
-    applied = server.edit_files(apply_plan=plan_id)
-    assert applied["ok"]
-    assert applied["applied"]
-    assert p.read_text() == "beta\n"
-
-
-def test_plan_apply_rejects_simultaneous_files(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    plan_id = dry["plan_id"]
-    result = server.edit_files(
-        files=[{"path": str(p), "edits": [{"old_text": "alpha", "new_text": "X"}]}],
-        apply_plan=plan_id,
-    )
-    assert not result["ok"]
-    assert "cannot specify both" in result["error"].lower()
-
-
-def test_plan_reused_after_successful_apply(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    plan_id = dry["plan_id"]
-    first = server.edit_files(apply_plan=plan_id)
-    assert first["ok"]
-    second = server.edit_files(apply_plan=plan_id)
-    assert not second["ok"]
-    assert "reused" in second["error"].lower()
-
-
-def test_plan_stale_during_apply(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    plan_id = dry["plan_id"]
-    # Modify file externally
-    p.write_text("gamma\n")
-    result = server.edit_files(apply_plan=plan_id)
-    assert not result["ok"]
-    assert "stale" in result["error"].lower()
-    # Plan should still be available (not consumed)
-    # Restore original content and retry
-    p.write_text("alpha\n")
-    retry = server.edit_files(apply_plan=plan_id)
-    assert retry["ok"]
-    assert p.read_text() == "beta\n"
-
-
-def test_plan_failed_apply_remains_available(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    plan_id = dry["plan_id"]
-    # Simulate stale (file modified)
-    p.write_text("gamma\n")
-    stale_result = server.edit_files(apply_plan=plan_id)
-    assert not stale_result["ok"]
-    # Plan should still be available
-    p.write_text("alpha\n")
-    retry = server.edit_files(apply_plan=plan_id)
-    assert retry["ok"]
-    assert retry["applied"]
-
-
-def test_plan_missing(tmp_path):
-    result = server.edit_files(apply_plan="nonexistent_plan_id_12345")
-    assert not result["ok"]
-    assert "missing" in result["error"].lower()
-
-
-def test_plan_expired(monkeypatch, tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    dry = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "beta"}]},
-    ], dry_run=True, create_plan=True)
-    plan_id = dry["plan_id"]
-    # Force expiry by setting TTL to 0
-    monkeypatch.setattr(server, "_PLAN_TTL", 0)
-    import time as _time
-    _time.sleep(0.01)
-    result = server.edit_files(apply_plan=plan_id)
-    assert not result["ok"]
-    assert "expired" in result["error"].lower()
-
-
-def test_plan_capacity_eviction(monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_PLAN_CAPACITY", 2)
-    # Clear existing plans
-    with server._PLAN_LOCK:
-        server._PLANS.clear()
-        server._REMOVED.clear()
-
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    plan_ids = []
-    for i in range(3):
-        dry = server.edit_files([
-            {"path": str(p), "edits": [{"old_text": "alpha", "new_text": f"v{i}"}]},
-        ], dry_run=True, create_plan=True)
-        # Reset file for next plan
-        p.write_text("alpha\n")
-        plan_ids.append(dry["plan_id"])
-
-    # First plan should be evicted
-    result = server.edit_files(apply_plan=plan_ids[0])
-    assert not result["ok"]
-    assert "evicted" in result["error"].lower()
-
-    # Last plan should still be available (not evicted or missing)
-    p.write_text("alpha\n")
-    result2 = server.edit_files(apply_plan=plan_ids[2])
-    # It may succeed or be stale, but must not be evicted or missing
-    if not result2["ok"]:
-        assert "evicted" not in result2["error"].lower()
-        assert "missing" not in result2["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +546,7 @@ def test_bom_crlf_mode_preservation_in_edit_files(tmp_path):
     p.write_bytes(content.encode("utf-8"))
     original_mode = p.stat().st_mode & 0o777
     result = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "line1", "new_text": "LINE1"}]},
+        {"path": str(p), "edits": [{"mode": "replace_match", "match_text": "line1", "write_text": "LINE1"}]},
     ])
     assert result["ok"]
     raw = p.read_bytes()
@@ -738,7 +562,7 @@ def test_bom_crlf_preservation_in_edit_file(tmp_path):
     p.write_bytes(content.encode("utf-8"))
     original_mode = p.stat().st_mode & 0o777
     result = server.edit_file(str(p), [
-        {"old_text": "hello", "new_text": "HELLO"},
+        {"mode": "replace_match", "match_text": "hello", "write_text": "HELLO"},
     ])
     assert result["ok"]
     raw = p.read_bytes()
@@ -770,8 +594,8 @@ def test_rollback_on_publication_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", failing_replace)
     result = server.edit_files([
-        {"path": str(p1), "edits": [{"old_text": "one", "new_text": "ONE"}]},
-        {"path": str(p2), "edits": [{"old_text": "two", "new_text": "TWO"}]},
+        {"path": str(p1), "edits": [{"mode": "replace_match", "match_text": "one", "write_text": "ONE"}]},
+        {"path": str(p2), "edits": [{"mode": "replace_match", "match_text": "two", "write_text": "TWO"}]},
     ])
     monkeypatch.undo()
 
@@ -800,7 +624,7 @@ def test_concurrent_stale_protection(tmp_path):
         barrier.wait()
         results[idx] = server.edit_files([
             {"path": str(p),
-             "edits": [{"old_text": "b", "new_text": f"v{idx}"}],
+             "edits": [{"mode": "replace_match", "match_text": "b", "write_text": f"v{idx}"}],
              "expected_sha256": sha},
         ])
 
@@ -819,43 +643,27 @@ def test_concurrent_stale_protection(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# JSON string / native array legacy behavior in edit_files
+# Minimal public edit contracts
 # ---------------------------------------------------------------------------
 
-def test_edit_files_accepts_json_string(tmp_path):
-    p1 = tmp_path / "a.txt"
-    p2 = tmp_path / "b.txt"
-    p1.write_text("alpha\n")
-    p2.write_text("beta\n")
-    payload = json.dumps([
-        {"path": str(p1), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-        {"path": str(p2), "edits": [{"old_text": "beta", "new_text": "BETA"}]},
-    ])
-    result = server.edit_files(payload)
-    assert result["ok"]
-    assert p1.read_text() == "ALPHA\n"
-    assert p2.read_text() == "BETA\n"
+def test_edit_apis_reject_legacy_payloads(tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("alpha\n")
+    legacy_edit = [{"old_text": "alpha", "new_text": "beta"}]
+    assert not server.edit_file(str(path), legacy_edit)["ok"]
+    assert not server.edit_file(str(path), "[]")["ok"]
+    assert not server.edit_files("[]")["ok"]
+    assert path.read_text() == "alpha\n"
 
 
-def test_edit_files_accepts_native_array(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    result = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]},
-    ])
-    assert result["ok"]
-    assert p.read_text() == "ALPHA\n"
-
-
-def test_edit_files_edits_as_json_string(tmp_path):
-    p = tmp_path / "a.txt"
-    p.write_text("alpha\n")
-    result = server.edit_files([
-        {"path": str(p),
-         "edits": json.dumps([{"old_text": "alpha", "new_text": "ALPHA"}])},
-    ])
-    assert result["ok"]
-    assert p.read_text() == "ALPHA\n"
+def test_public_tool_signatures_are_minimal():
+    import inspect
+    assert list(inspect.signature(server.write_file).parameters) == ["path", "content"]
+    assert list(inspect.signature(server.append_file).parameters) == [
+        "path", "content", "expected_sha256"]
+    assert list(inspect.signature(server.edit_file).parameters) == [
+        "path", "edits", "dry_run", "expected_sha256"]
+    assert list(inspect.signature(server.edit_files).parameters) == ["files", "dry_run"]
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +690,7 @@ def test_edit_files_rejects_binary(tmp_path):
     p = tmp_path / "f.bin"
     p.write_bytes(b"\xff\xfe\x00\x01binary\xff")
     result = server.edit_files([
-        {"path": str(p), "edits": [{"old_text": "x", "new_text": "y"}]},
+        {"path": str(p), "edits": [{"mode": "replace_match", "match_text": "x", "write_text": "y"}]},
     ])
     assert not result["ok"]
     assert "utf-8" in result["error"].lower() or "unicode" in result["error"].lower()
