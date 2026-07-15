@@ -313,6 +313,81 @@ def test_insert_after_with_newline_content(tmp_path):
     assert path.read_text() == "a\nb\nX\nY\nc\n"
 
 
+def test_same_boundary_edits_abort_without_writing(tmp_path):
+    path = tmp_path / "imports.py"
+    source = "import re\nimport subprocess\nimport tempfile\n"
+    edits = [
+        {"mode": "insert_after", "match_text": "import re\n",
+         "write_text": "import signal\n"},
+        {"mode": "replace_match", "match_text": "import subprocess\n",
+         "write_text": ""},
+    ]
+
+    for payload in (edits, list(reversed(edits))):
+        path.write_text(source)
+        result = server.edit_file(str(path), payload)
+        assert not result["ok"]
+        assert result["batch_aborted"]
+        assert any("conflict" in (item["reason"] or "") for item in result["results"])
+        assert path.read_text() == source
+
+
+def test_fuzzy_match_preserves_all_unmatched_text(tmp_path):
+    path = tmp_path / "unicode.txt"
+    source = "value = “target”\nkeep = “untouched”—x  \n"
+    path.write_text(source)
+
+    result = server.edit_file(str(path), [{
+        "mode": "replace_match",
+        "match_text": 'value = "target"',
+        "write_text": 'value = "changed"',
+    }])
+
+    assert result["ok"]
+    assert path.read_text() == 'value = "changed"\nkeep = “untouched”—x  \n'
+
+
+def test_fuzzy_match_maps_nfkc_source_spans(tmp_path):
+    ligature = tmp_path / "ligature.txt"
+    combining = tmp_path / "combining.txt"
+    ligature.write_text("ﬁle = 1\nkeep = “x”—y  \n")
+    combining.write_text("cafe\u0301 = 1\nkeep  \n")
+
+    first = server.edit_file(str(ligature), [{
+        "mode": "replace_match", "match_text": "file = 1", "write_text": "file = 2",
+    }])
+    second = server.edit_file(str(combining), [{
+        "mode": "replace_match", "match_text": "café = 1", "write_text": "cafe = 2",
+    }])
+
+    assert first["ok"] and second["ok"]
+    assert ligature.read_text() == "file = 2\nkeep = “x”—y  \n"
+    assert combining.read_text() == "cafe = 2\nkeep  \n"
+
+
+def test_adjacent_and_separate_edits_remain_allowed(tmp_path):
+    adjacent = tmp_path / "adjacent.txt"
+    imports = tmp_path / "imports.py"
+    adjacent.write_text("abc")
+    imports.write_text("import re\nimport subprocess\nimport tempfile\n")
+
+    first = server.edit_file(str(adjacent), [
+        {"mode": "replace_match", "match_text": "a", "write_text": "A"},
+        {"mode": "replace_match", "match_text": "b", "write_text": "B"},
+    ])
+    second = server.edit_file(str(imports), [
+        {"mode": "insert_after", "match_text": "import re\n",
+         "write_text": "import signal\n"},
+        {"mode": "replace_match", "match_text": "import tempfile",
+         "write_text": "import pathlib"},
+    ])
+
+    assert first["ok"] and second["ok"]
+    assert adjacent.read_text() == "ABc"
+    assert imports.read_text() == (
+        "import re\nimport signal\nimport subprocess\nimport pathlib\n")
+
+
 
 
 # ---------------------------------------------------------------------------

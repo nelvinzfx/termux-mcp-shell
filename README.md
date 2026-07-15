@@ -152,11 +152,14 @@ Example transaction:
 ```
 
 Every match must resolve uniquely. Matching supports normalized Unicode,
-trailing-whitespace tolerance, and indentation-insensitive blocks. The server
-validates every file before writing anything, preserves UTF-8 BOM, line endings,
-and permission modes, always returns diffs, and attempts rollback if publishing
-one file fails. `dry_run` previews without writes; apply the same payload later
-with `expected_sha256` values to reject stale sources.
+trailing-whitespace tolerance, and indentation-insensitive blocks. Fuzzy matching
+only locates the original source span; unmatched text is never normalized or
+rewritten. Overlapping edits and multiple operations at the same source position
+are rejected before writing. The server validates every file before writing
+anything, preserves UTF-8 BOM, line endings, and permission modes, always returns
+diffs, and attempts rollback if publishing one file fails. `dry_run` previews
+without writes; apply the same payload later with `expected_sha256` values to
+reject stale sources.
 
 ## Authentication
 

@@ -284,25 +284,93 @@ _DASHES = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]")
 _SPACES = re.compile(r"[\u00A0\u2002-\u200A\u202F\u205F\u3000]")
 
 
-def _fuzzy(t: str) -> str:
-    t = unicodedata.normalize("NFKC", t)
-    t = "\n".join(line.rstrip() for line in t.split("\n"))
-    t = _SMART_SINGLE.sub("'", t)
-    t = _SMART_DOUBLE.sub('"', t)
-    t = _DASHES.sub("-", t)
-    t = _SPACES.sub(" ", t)
-    return t
+def _fuzzy_projection(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Return fuzzy comparison text plus source spans for every output char."""
+    chars: list[str] = []
+    kept_spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        newline = text.find("\n", cursor)
+        line_end = len(text) if newline == -1 else newline
+        source_line = text[cursor:line_end]
+        normalized = unicodedata.normalize("NFKC", source_line)
+
+        spans: list[tuple[int, int]] = []
+        if normalized == source_line:
+            spans = [(cursor + i, cursor + i + 1) for i in range(len(normalized))]
+        else:
+            matcher = difflib.SequenceMatcher(
+                None, source_line, normalized, autojunk=False)
+            source_pos = normalized_pos = 0
+            for block in matcher.get_matching_blocks():
+                if block.b > normalized_pos:
+                    span = (cursor + source_pos, cursor + block.a)
+                    spans.extend(span for _ in range(block.b - normalized_pos))
+                spans.extend(
+                    (cursor + block.a + i, cursor + block.a + i + 1)
+                    for i in range(block.size))
+                source_pos = block.a + block.size
+                normalized_pos = block.b + block.size
+
+        trimmed_end = len(normalized.rstrip())
+        chars.extend(normalized[:trimmed_end])
+        kept_spans.extend(spans[:trimmed_end])
+        if newline == -1:
+            break
+        chars.append("\n")
+        kept_spans.append((newline, newline + 1))
+        cursor = newline + 1
+
+    for i, char in enumerate(chars):
+        if _SMART_SINGLE.fullmatch(char):
+            chars[i] = "'"
+        elif _SMART_DOUBLE.fullmatch(char):
+            chars[i] = '"'
+        elif _DASHES.fullmatch(char):
+            chars[i] = "-"
+        elif _SPACES.fullmatch(char):
+            chars[i] = " "
+    return "".join(chars), kept_spans
 
 
-def _find(content: str, old: str) -> tuple[bool, int, int, bool]:
-    i = content.find(old)
-    if i != -1:
-        return True, i, len(old), False
-    fc, fo = _fuzzy(content), _fuzzy(old)
-    fi = fc.find(fo)
-    if fi == -1:
-        return False, -1, 0, False
-    return True, fi, len(fo), True
+def _fuzzy(text: str) -> str:
+    return _fuzzy_projection(text)[0]
+
+
+def _all_occurrences(content: str, search: str) -> list[int]:
+    if not search:
+        return []
+    starts = []
+    cursor = 0
+    while True:
+        index = content.find(search, cursor)
+        if index == -1:
+            return starts
+        starts.append(index)
+        cursor = index + 1
+
+
+def _find_matches(content: str, search: str) -> tuple[list[tuple[int, int]], bool]:
+    exact = _all_occurrences(content, search)
+    if exact:
+        return [(start, start + len(search)) for start in exact], False
+
+    projected, spans = _fuzzy_projection(content)
+    target = _fuzzy(search)
+    fuzzy_starts = _all_occurrences(projected, target)
+    matches = []
+    for start in fuzzy_starts:
+        selected = spans[start:start + len(target)]
+        if not selected:
+            continue
+        source_start = min(span[0] for span in selected)
+        source_end = max(span[1] for span in selected)
+        match = (source_start, source_end)
+        source_slice = content[source_start:source_end]
+        if (source_end > source_start and _fuzzy(source_slice) == target
+                and match not in matches):
+            matches.append(match)
+    return matches, True
 
 
 def _find_indent(content: str, old: str) -> tuple[bool, int, int, str]:
@@ -347,16 +415,15 @@ def _reindent(new: str, matched: str, old: str) -> str:
     return "\n".join(out)
 
 
-def _match_one(base: str, used_fuzzy: bool, old: str, new: str, path: str, label: str):
-    """Resolve one edit: exact/trailing-fuzzy, then indent-insensitive with re-indent."""
-    found, idx, mlen, _ = _find(base, old)
-    if found:
-        fo = _fuzzy(old) if used_fuzzy else old
-        occ = base.count(fo)
-        if occ > 1:
-            raise ValueError(f"Found {occ} occurrences of {label} in {path}. Each match_text must "
-                             f"be unique. Provide more context.")
-        return idx, mlen, new
+def _match_one(base: str, old: str, new: str, path: str, label: str):
+    """Resolve one edit in original source coordinates."""
+    matches, _ = _find_matches(base, old)
+    if len(matches) > 1:
+        raise ValueError(f"Found {len(matches)} occurrences of {label} in {path}. Each match_text must "
+                         f"be unique. Provide more context.")
+    if matches:
+        start, end = matches[0]
+        return start, end - start, new
     fi, fidx, flen, matched = _find_indent(base, old)
     if fi:
         return fidx, flen, _reindent(new, matched, old)
@@ -395,7 +462,7 @@ def _normalize_edit(e: dict) -> dict:
         "write_text": _normalize_lf(write_text),
     }
 
-def _resolve_insert(base: str, used_fuzzy: bool, mode: str, anchor: str,
+def _resolve_insert(base: str, mode: str, anchor: str,
                     content: str, path: str, label: str) -> tuple[int, int, str]:
     """Resolve an insert edit. Returns (insert_index, 0, content).
 
@@ -404,12 +471,12 @@ def _resolve_insert(base: str, used_fuzzy: bool, mode: str, anchor: str,
     anchor's actual indentation.
     """
     reindented = content
-    found, idx, mlen, _ = _find(base, anchor)
-    if found:
-        fo = _fuzzy(anchor) if used_fuzzy else anchor
-        occ = base.count(fo)
-        if occ > 1:
-            raise ValueError(f"{label}: anchor found {occ} times in {path}. Anchor must be unique.")
+    matches, _ = _find_matches(base, anchor)
+    if len(matches) > 1:
+        raise ValueError(f"{label}: anchor found {len(matches)} times in {path}. Anchor must be unique.")
+    if matches:
+        idx, end = matches[0]
+        mlen = end - idx
     else:
         fi, fidx, flen, matched = _find_indent(base, anchor)
         if fi:
@@ -481,12 +548,10 @@ def _ambiguity_info(content: str, search: str, max_candidates: int = 5) -> dict:
 
 def _apply_edits(normalized: str, edits: list[dict], path: str
                  ) -> tuple[str, str, list[dict], str | None]:
-    """Resolve every edit first; any failure aborts the whole file."""
+    """Resolve every edit against original text; any conflict aborts the file."""
     norm = [_normalize_edit(e) for e in edits]
-    search_texts = [e["match_text"] for e in norm]
-    used_fuzzy = any(_find(normalized, text)[3] for text in search_texts)
     original = normalized
-    base = _fuzzy(normalized) if used_fuzzy else normalized
+    base = normalized
     matched, results = [], []
     for i, edit in enumerate(norm):
         result = {
@@ -503,18 +568,17 @@ def _apply_edits(normalized: str, edits: list[dict], path: str
         try:
             if edit["mode"] == "replace_match":
                 idx, match_len, new_text = _match_one(
-                    base, used_fuzzy, edit["match_text"], edit["write_text"], path, label)
+                    base, edit["match_text"], edit["write_text"], path, label)
             else:
                 idx, match_len, new_text = _resolve_insert(
-                    base, used_fuzzy, edit["mode"], edit["match_text"],
-                    edit["write_text"], path, label)
+                    base, edit["mode"], edit["match_text"], edit["write_text"], path, label)
             result["match_count"] = 1
             matched.append({"i": i, "idx": idx, "len": match_len, "new": new_text})
             result.update(matched=True, ok=True, status="matched")
         except ValueError as error:
             result["reason"] = str(error)
             result["error"] = str(error)
-            occurrences = original.count(edit["match_text"])
+            occurrences = len(_find_matches(original, edit["match_text"])[0])
             result["match_count"] = occurrences
             if occurrences == 0:
                 result.update(_closest_match(original, edit["match_text"]))
@@ -523,10 +587,13 @@ def _apply_edits(normalized: str, edits: list[dict], path: str
         results.append(result)
 
     failure = next((result for result in results if not result["ok"]), None)
-    ordered = sorted(matched, key=lambda item: item["idx"])
+    ordered = sorted(matched, key=lambda item: (item["idx"], item["len"] == 0, item["i"]))
     for left, right in zip(ordered, ordered[1:]):
-        if left["idx"] + left["len"] > right["idx"]:
-            message = f"edits[{left['i']}] and edits[{right['i']}] overlap in {path}. Merge them."
+        left_end = left["idx"] + left["len"]
+        overlaps = left_end > right["idx"]
+        same_boundary = left["idx"] == right["idx"]
+        if overlaps or same_boundary:
+            message = f"edits[{left['i']}] and edits[{right['i']}] conflict in {path}. Merge them."
             result = results[right["i"]]
             result.update(matched=False, ok=False, status="failed", reason=message, error=message)
             failure = failure or result
