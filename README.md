@@ -10,10 +10,13 @@ Streamable HTTP MCP server that gives an agent shell and file access inside Term
 curl -fsSL https://raw.githubusercontent.com/nelvinzfx/termux-mcp-shell/master/install.sh | sh
 ```
 
-The installer installs Python and Git, clones or updates the repository at
-`~/termux-mcp-shell`, installs Python dependencies, creates `mcpsh` and
-`mcpsh-stop`, and adds the repository's `bin` directory to detected Bash, Zsh,
-or Fish configuration. It is safe to rerun.
+The installer installs Python, Git, and Termux's native Rust build toolchain,
+clones or updates the repository at `~/termux-mcp-shell`, installs Python
+dependencies, creates `mcpsh` and `mcpsh-stop`, and adds the repository's `bin`
+directory to detected Bash, Zsh, or Fish configuration. Rust is required because
+PyPI does not provide Android wheels for `pydantic-core`; the installer prepares
+`maturin` and disables build isolation so pip uses Termux's Rust instead of the
+unsupported rustup Android target. It is safe to rerun.
 
 Use another destination or repository with:
 
@@ -25,8 +28,9 @@ MCP_DEST=$HOME/mcp MCP_REPO_URL=https://github.com/example/fork \
 ### Manual
 
 ```sh
-pkg install python git
-pip install -r requirements.txt
+pkg install python python-pip git rust make pkg-config patchelf
+python -m pip install --upgrade "setuptools>=70.1" wheel "maturin>=1.10,<2"
+python -m pip install --no-build-isolation -r requirements.txt
 python server.py
 ```
 

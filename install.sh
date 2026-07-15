@@ -11,8 +11,10 @@ DEST="${MCP_DEST:-$HOME/termux-mcp-shell}"
 log() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 
 # 1. system deps
-log "Installing python + git (pkg)"
-pkg install -y python git >/dev/null 2>&1 || {
+# PyPI does not publish Android wheels for pydantic-core. A clean Termux install
+# must build it locally, so provide Termux's native Rust toolchain up front.
+log "Installing Python, Git, and native build tools (pkg)"
+pkg install -y python python-pip git rust make pkg-config patchelf >/dev/null 2>&1 || {
     echo "pkg install failed. Run 'pkg update' first?" >&2; exit 1; }
 
 # 2. get the source: use current dir if server.py is here, else clone
@@ -35,8 +37,14 @@ else
 fi
 
 # 3. python deps
+# Pydantic uses maturin to build pydantic-core. Installing the backend first and
+# disabling PEP 517 build isolation prevents pip from trying rustup, which does
+# not support Termux's aarch64-unknown-linux-android target.
+log "Preparing Python build backend"
+python -m pip install --upgrade "setuptools>=70.1" wheel "maturin>=1.10,<2"
+
 log "Installing Python dependencies"
-pip install -r "$DEST/requirements.txt"
+python -m pip install --no-build-isolation -r "$DEST/requirements.txt"
 
 # 4. create mcpsh / mcpsh-stop scripts
 log "Creating mcpsh / mcpsh-stop commands"
