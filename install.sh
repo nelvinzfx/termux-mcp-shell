@@ -40,6 +40,16 @@ fi
 # Pydantic uses maturin to build pydantic-core. Installing the backend first and
 # disabling PEP 517 build isolation prevents pip from trying rustup, which does
 # not support Termux's aarch64-unknown-linux-android target.
+# maturin also refuses to build for Android without an explicit API level, so
+# derive it from the device (fallback 24, Termux's minimum supported level).
+if [ -z "${ANDROID_API_LEVEL:-}" ]; then
+    ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || true)"
+    case "$ANDROID_API_LEVEL" in
+        ''|*[!0-9]*) ANDROID_API_LEVEL=24 ;;
+    esac
+    export ANDROID_API_LEVEL
+fi
+log "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL"
 log "Preparing Python build backend"
 python -m pip install --upgrade "setuptools>=70.1" wheel "maturin>=1.10,<2"
 
