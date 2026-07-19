@@ -11,11 +11,45 @@ DEST="${MCP_DEST:-$HOME/termux-mcp-shell}"
 log() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 
 # 1. system deps
-# PyPI does not publish Android wheels for pydantic-core. A clean Termux install
-# must build it locally, so provide Termux's native Rust toolchain up front.
+# PyPI does not publish Android wheels for pydantic-core. Install Rust and its
+# matching host standard library explicitly: pkg can otherwise leave rust-std at
+# an older version and fail much later during a native build.
+case "$(dpkg --print-architecture 2>/dev/null || true)" in
+    aarch64) RUST_STD_PACKAGE="rust-std-aarch64-linux-android" ;;
+    arm) RUST_STD_PACKAGE="rust-std-armv7-linux-androideabi" ;;
+    i686) RUST_STD_PACKAGE="rust-std-i686-linux-android" ;;
+    x86_64) RUST_STD_PACKAGE="rust-std-x86-64-linux-android" ;;
+    *)
+        echo "Unsupported Termux architecture; cannot select the Rust standard library package." >&2
+        exit 1
+        ;;
+esac
+
 log "Installing Python, Git, and native build tools (pkg)"
-pkg install -y python python-pip git rust make pkg-config patchelf >/dev/null 2>&1 || {
-    echo "pkg install failed. Run 'pkg update' first?" >&2; exit 1; }
+if ! pkg install -y python python-pip git rust "$RUST_STD_PACKAGE" make pkg-config patchelf python-cryptography; then
+    echo "pkg install failed. Run 'pkg update' first?" >&2
+    exit 1
+fi
+
+rust_version="$(dpkg-query -W -f='${Version}' rust 2>/dev/null || true)"
+rust_std_version="$(dpkg-query -W -f='${Version}' "$RUST_STD_PACKAGE" 2>/dev/null || true)"
+if [ -z "$rust_version" ] || [ "$rust_version" != "$rust_std_version" ]; then
+    echo "Rust package mismatch: rust=${rust_version:-missing}, $RUST_STD_PACKAGE=${rust_std_version:-missing}." >&2
+    echo "Run 'pkg update && pkg install rust $RUST_STD_PACKAGE', then rerun this installer." >&2
+    exit 1
+fi
+
+# cryptography's no-isolation build imports cffi before pip installs the rest of
+# the transaction. Termux's native package provides both ahead of that build.
+if ! python - <<'PY'
+import cffi
+import cryptography
+PY
+then
+    echo "python-cryptography did not provide importable cryptography and cffi modules." >&2
+    echo "Run 'pkg update && pkg reinstall python-cryptography', then rerun this installer." >&2
+    exit 1
+fi
 
 # 2. get the source: use current dir if server.py is here, else clone
 if [ -f "./server.py" ] && [ -f "./requirements.txt" ]; then
@@ -40,16 +74,51 @@ fi
 # Pydantic uses maturin to build pydantic-core. Installing the backend first and
 # disabling PEP 517 build isolation prevents pip from trying rustup, which does
 # not support Termux's aarch64-unknown-linux-android target.
-# maturin also refuses to build for Android without an explicit API level, so
-# derive it from the device (fallback 24, Termux's minimum supported level).
-if [ -z "${ANDROID_API_LEVEL:-}" ]; then
-    ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || true)"
-    case "$ANDROID_API_LEVEL" in
-        ''|*[!0-9]*) ANDROID_API_LEVEL=24 ;;
-    esac
-    export ANDROID_API_LEVEL
+# Use the active Python build platform's API level. The device OS API may be
+# newer, producing wheels that this same Python rejects as incompatible.
+PYTHON_ANDROID_API_LEVEL="$(python - <<'PY'
+import re
+import sysconfig
+
+platform = sysconfig.get_platform()
+match = re.fullmatch(r"android-(\d+)-(.+)", platform)
+level = sysconfig.get_config_var("ANDROID_API_LEVEL")
+if level is None and match:
+    level = match.group(1)
+try:
+    level = int(level)
+except (TypeError, ValueError):
+    raise SystemExit(f"cannot derive Android API level from Python platform {platform!r}")
+if not match or int(match.group(1)) != level:
+    raise SystemExit(
+        f"inconsistent Python Android platform: platform={platform!r}, API={level!r}")
+
+try:
+    from packaging.tags import sys_tags
+except ImportError:
+    from pip._vendor.packaging.tags import sys_tags
+wheel_platform = f"android_{level}_{match.group(2)}"
+if not any(tag.platform == wheel_platform for tag in sys_tags()):
+    raise SystemExit(
+        f"active Python does not accept derived wheel platform {wheel_platform!r}")
+print(level)
+PY
+)" || {
+    echo "Failed to derive a compatible Android API level from the active Python." >&2
+    exit 1
+}
+case "$PYTHON_ANDROID_API_LEVEL" in
+    ''|*[!0-9]*)
+        echo "Active Python returned an invalid Android API level: $PYTHON_ANDROID_API_LEVEL" >&2
+        exit 1
+        ;;
+esac
+if [ -n "${ANDROID_API_LEVEL:-}" ] && [ "$ANDROID_API_LEVEL" != "$PYTHON_ANDROID_API_LEVEL" ]; then
+    log "Ignoring inherited ANDROID_API_LEVEL=$ANDROID_API_LEVEL; active Python requires $PYTHON_ANDROID_API_LEVEL"
 fi
-log "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL"
+ANDROID_API_LEVEL="$PYTHON_ANDROID_API_LEVEL"
+export ANDROID_API_LEVEL
+log "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL from the active Python platform"
 log "Preparing Python build backend"
 python -m pip install --upgrade "setuptools>=70.1" wheel "maturin>=1.10,<2"
 
