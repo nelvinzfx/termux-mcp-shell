@@ -625,12 +625,18 @@ def _resolve_insert(base: str, mode: str, anchor: str,
 # Diagnostics helpers (bounded, never include large unrelated content)
 # ---------------------------------------------------------------------------
 
+def _diagnostic_lines(content: str) -> list[str]:
+    """Return LF-delimited source lines without synthesizing lines from bare CRs."""
+    lines = content.split("\n")
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def _closest_match(content: str, search: str, max_excerpt: int = 500) -> dict:
-    """Find the closest matching line for no-match diagnostics."""
+    """Find the closest matching real source line for no-match diagnostics."""
     search_first = search.strip().split("\n")[0] if search.strip() else search
     if not search_first:
         return {}
-    content_lines = content.split("\n")
+    content_lines = _diagnostic_lines(content)
     best_ratio = 0.0
     best_line = -1
     for i, line in enumerate(content_lines):
@@ -645,7 +651,8 @@ def _closest_match(content: str, search: str, max_excerpt: int = 500) -> dict:
     lines = []
     for j in range(start, end):
         prefix = ">>" if j == best_line else "  "
-        lines.append(f"{prefix} {j + 1}: {content_lines[j]}")
+        source_line = content_lines[j].replace("\r", "\\r")
+        lines.append(f"{prefix} {j + 1}: {source_line}")
     return {
         "closest_match_line": best_line + 1,
         "similarity": round(best_ratio, 3),
@@ -654,25 +661,28 @@ def _closest_match(content: str, search: str, max_excerpt: int = 500) -> dict:
 
 
 def _ambiguity_info(content: str, search: str, max_candidates: int = 5) -> dict:
-    """Return bounded candidate lines for ambiguous-match diagnostics."""
-    content_lines = content.split("\n")
+    """Return bounded candidate lines from the real source text."""
+    content_lines = _diagnostic_lines(content)
     search_first = search.strip().split("\n")[0] if search.strip() else search
     if not search_first:
         return {}
     candidates = []
     for i, line in enumerate(content_lines):
         if search_first in line:
-            candidates.append({"line": i + 1, "text": line.strip()[:200]})
+            text = line.strip().replace("\r", "\\r")
+            candidates.append({"line": i + 1, "text": text[:200]})
         if len(candidates) >= max_candidates:
             break
     return {"candidate_lines": candidates} if candidates else {}
 
 
-def _apply_edits(normalized: str, edits: list[dict], path: str
+def _apply_edits(normalized: str, edits: list[dict], path: str,
+                 diagnostic_content: str | None = None
                  ) -> tuple[str, str, list[dict], str | None]:
-    """Resolve every edit against original text; any conflict aborts the file."""
+    """Resolve every edit against normalized text and diagnose from real source text."""
     norm = [_normalize_edit(e) for e in edits]
     original = normalized
+    diagnostic_source = normalized if diagnostic_content is None else diagnostic_content
     base = normalized
     matched, results = [], []
     for i, edit in enumerate(norm):
@@ -703,9 +713,9 @@ def _apply_edits(normalized: str, edits: list[dict], path: str
             occurrences = len(_find_matches(original, edit["match_text"])[0])
             result["match_count"] = occurrences
             if occurrences == 0:
-                result.update(_closest_match(original, edit["match_text"]))
+                result.update(_closest_match(diagnostic_source, edit["match_text"]))
             elif occurrences > 1:
-                result.update(_ambiguity_info(original, edit["match_text"]))
+                result.update(_ambiguity_info(diagnostic_source, edit["match_text"]))
         results.append(result)
 
     failure = next((result for result in results if not result["ok"]), None)
@@ -851,6 +861,8 @@ def append_file(path: str, content: str,
 
 class EditResult(TypedDict):
     ok: bool
+    applied: bool
+    dry_run: bool
     path: str
     replacements: int
     changed: bool
@@ -1173,7 +1185,7 @@ def _run_transaction(file_specs: list, dry_run: bool) -> dict:
         old_mode = canon.stat().st_mode & 0o777
         try:
             base, new, results, batch_error = _apply_edits(
-                normalized, spec["edits"], str(canon))
+                normalized, spec["edits"], str(canon), diagnostic_content=content)
         except (KeyError, TypeError, ValueError) as error:
             return _tx_error(f"invalid edit in {spec['path']}: {error}")
 
@@ -1235,6 +1247,8 @@ def edit_file(path: str, edits: list[EditSpec], dry_run: bool = False,
     if not transaction["files"]:
         return {
             "ok": False,
+            "applied": transaction["applied"],
+            "dry_run": transaction["dry_run"],
             "path": path,
             "replacements": 0,
             "changed": False,
@@ -1247,6 +1261,8 @@ def edit_file(path: str, edits: list[EditSpec], dry_run: bool = False,
     replacements = sum(1 for result in item["results"] or [] if result["ok"])
     return {
         "ok": transaction["ok"] and item["ok"],
+        "applied": transaction["applied"],
+        "dry_run": transaction["dry_run"],
         "path": item["path"],
         "replacements": replacements if item["changed"] else 0,
         "changed": item["changed"],

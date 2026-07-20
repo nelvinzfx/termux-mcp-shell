@@ -434,6 +434,30 @@ def test_missing_match_text_has_closest_match(tmp_path):
     assert r["closest_match_line"] == 1
 
 
+def test_failed_match_diagnostics_use_real_file_lines_for_both_edit_tools(tmp_path):
+    source = b"line one\r\nline two\rliteral\r\n\r\nclosing)\r\n"
+    paths = [tmp_path / "single.txt", tmp_path / "multi.txt"]
+    for path in paths:
+        path.write_bytes(source)
+
+    single = server.edit_file(str(paths[0]), [
+        {"mode": "replace_match", "match_text": "closing}", "write_text": "X"}
+    ])
+    multi = server.edit_files([{
+        "path": str(paths[1]),
+        "edits": [
+            {"mode": "replace_match", "match_text": "closing}", "write_text": "X"}
+        ],
+    }])
+
+    diagnostics = [single["results"][0], multi["files"][0]["results"][0]]
+    for result in diagnostics:
+        assert result["closest_match_line"] == 4
+        assert ">> 4: closing)" in result["nearby_text"]
+        assert "2: line two\\rliteral" in result["nearby_text"]
+    assert all(path.read_bytes() == source for path in paths)
+
+
 def test_diagnostics_are_bounded(tmp_path):
     """nearby_text should never include large unrelated content."""
     path = tmp_path / "f.txt"
@@ -821,6 +845,8 @@ def test_edit_file_dry_run_no_write(tmp_path):
     ], dry_run=True)
     assert result["ok"]
     assert result["diff"]
+    assert result["dry_run"] is True
+    assert result["applied"] is False
     assert p.read_bytes() == orig
 
 
